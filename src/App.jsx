@@ -100,23 +100,30 @@ export default function App() {
   const [showScanner, setShowScanner] = useState(false);
   const [user, setUser] = useState(null);
   const [authError, setAuthError] = useState('');
-  // 初始化 Auth:优先自定义 token,否则匿名登录
-  useEffect(() => {
-    const initAuth = async () => {
-      try {
-        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-          await signInWithCustomToken(auth, __initial_auth_token);
-        } else {
-          await signInAnonymously(auth);
-        }
-      } catch (err) {
-        console.error("认证初始化失败", err);
+// 初始化 Auth:优先恢复已有登录态,无用户时才匿名登录
+useEffect(() => {
+  const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+    if (currentUser) {
+      // 已有用户(Google 已登录 或 已有匿名会话)→ 直接用,不要再匿名登录
+      setUser(currentUser);
+    } else {
+      // 确实没有任何用户时,才走匿名/自定义 token 登录
+      if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+        signInWithCustomToken(auth, __initial_auth_token).catch((err) =>
+          console.error('自定义 token 登录失败', err)
+        );
+      } else {
+        signInAnonymously(auth).catch((err) =>
+          console.error('匿名登录失败', err)
+        );
       }
-    };
-    initAuth();
-    const unsubscribe = onAuthStateChanged(auth, setUser);
-    return () => unsubscribe();
-  }, []);
+    }
+  });
+
+  return () => unsubscribe();
+}, []);
+
+
   // 云端历史记录同步(按 UID 隔离)
   useEffect(() => {
     try {
