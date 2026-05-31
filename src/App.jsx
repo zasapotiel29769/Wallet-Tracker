@@ -2,8 +2,22 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { Search, History, Settings, ChevronLeft, ChevronRight, Edit2, Check, ExternalLink, Copy, AlertCircle, X, Wallet, ArrowDownRight, ArrowUpRight, Clock, Box, Loader2, DollarSign, Coins, PieChart, Scan } from 'lucide-react';
 
 import { initializeApp } from 'firebase/app';
-import { getAuth, signInAnonymously, signInWithCustomToken, signInWithPopup, GoogleAuthProvider, signOut, onAuthStateChanged } from 'firebase/auth';
-import { getFirestore, doc, setDoc, onSnapshot } from 'firebase/firestore';
+import { getAnalytics } from "firebase/analytics";
+import {
+  getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged,
+  GoogleAuthProvider, signInWithPopup, signOut,
+  linkWithPopup, signInWithCredential, // ★ 改动:新增 link/credential
+} from 'firebase/auth';
+
+import {
+  getFirestore, doc, onSnapshot, setDoc, getDoc, deleteDoc, // ★ 改动:新增 getDoc/deleteDoc
+} from 'firebase/firestore';
+
+import {
+  Wallet, Settings, History, Box, Search, Scan, Loader2, AlertCircle, X,
+  PieChart, DollarSign, Coins, ChevronLeft, ChevronRight, Clock,
+  ArrowDownRight, ArrowUpRight, Copy, ExternalLink, Check, Edit2,
+} from 'lucide-react';
 
 const firebaseConfig = {
   apiKey: "AIzaSyBfLcdkM6CntqcPbOX42p8QXwmpsHnaKAs",
@@ -17,18 +31,16 @@ const firebaseConfig = {
 
 
 const app = initializeApp(firebaseConfig);
+const analytics = getAnalytics(app);
 const auth = getAuth(app);
 const db = getFirestore(app);
 const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
-
-const FETCH_LIMIT = 50; 
-const PAGE_SIZE = 20;   
-
+const FETCH_LIMIT = 50;
+const PAGE_SIZE = 20;
 const shortenAddress = (address) => {
   if (!address) return '';
   return `${address.slice(0, 6)}...${address.slice(-4)}`;
 };
-
 const formatTime = (timestamp) => {
   if (!timestamp) return '';
   const date = new Date(parseInt(timestamp));
@@ -37,7 +49,6 @@ const formatTime = (timestamp) => {
     hour: '2-digit', minute: '2-digit', second: '2-digit'
   });
 };
-
 const copyToClipboard = (text) => {
   try {
     const el = document.createElement('textarea');
@@ -50,7 +61,6 @@ const copyToClipboard = (text) => {
     console.error('复制失败', err);
   }
 };
-
 const formatAmount = (value, decimals = 18) => {
   if (!value) return '0';
   const num = parseFloat(value) / Math.pow(10, parseInt(decimals || 18));
@@ -58,10 +68,8 @@ const formatAmount = (value, decimals = 18) => {
   if (num < 0.000001) return '<0.000001';
   return num.toLocaleString('en-US', { maximumFractionDigits: 6 });
 };
-
 const parseQrAddress = (text) => {
   let addr = text;
-  // 处理标准的包含前缀的二维码内容，例如 ethereum:0x... 或 tron:T...
   if (addr.toLowerCase().startsWith('ethereum:')) {
     addr = addr.substring(9).split('@')[0];
   } else if (addr.toLowerCase().startsWith('tron:')) {
@@ -69,42 +77,31 @@ const parseQrAddress = (text) => {
   }
   return addr.trim();
 };
-
+// ★ 改动:统一的历史文档路径工具,避免到处手写
+const historyRef = (uid) =>
+  doc(db, 'artifacts', appId, 'users', uid, 'wallet_data', 'history');
 export default function App() {
   const [address, setAddress] = useState('');
   const [chain, setChain] = useState('AUTO');
-  
-  // 数据与加载状态
   const [allTransactions, setAllTransactions] = useState([]);
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState(null);
-  
-  // API 与前端分页状态
   const [apiPage, setApiPage] = useState(1);
   const [hasMoreData, setHasMoreData] = useState(false);
   const [currentPage, setCurrentPage] = useState(1);
   const [currentQuery, setCurrentQuery] = useState({ address: '', chain: '' });
-  
-  // 资产概览状态
   const [walletInfo, setWalletInfo] = useState(null);
   const [fetchingBalance, setFetchingBalance] = useState(false);
-  
-  // 本地存储状态
   const [history, setHistory] = useState([]);
   const [ethApiKey, setEthApiKey] = useState('');
   const [showSettings, setShowSettings] = useState(false);
   const [filterType, setFilterType] = useState('ALL');
-
-  // 扫码功能状态
   const [isMobile, setIsMobile] = useState(false);
   const [showScanner, setShowScanner] = useState(false);
-
-  // 云端用户状态
   const [user, setUser] = useState(null);
   const [authError, setAuthError] = useState('');
-
-  // 初始化 Google Auth 及匿名登录
+  // 初始化 Auth:优先自定义 token,否则匿名登录
   useEffect(() => {
     const initAuth = async () => {
       try {
@@ -118,72 +115,115 @@ export default function App() {
       }
     };
     initAuth();
-    
     const unsubscribe = onAuthStateChanged(auth, setUser);
     return () => unsubscribe();
   }, []);
-
-  // 云端历史记录同步 (替代旧版的 localStorage 读写)
+  // 云端历史记录同步(按 UID 隔离)
   useEffect(() => {
     try {
       const savedKey = localStorage.getItem('eth_api_key');
       if (savedKey) setEthApiKey(savedKey);
     } catch (e) {}
-
     if (!user) return;
-
-    const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'wallet_data', 'history');
-    
-    const unsubscribe = onSnapshot(docRef, (docSnap) => {
+    const ref = historyRef(user.uid);
+    const unsubscribe = onSnapshot(ref, (docSnap) => {
       if (docSnap.exists()) {
         setHistory(docSnap.data().items || []);
       } else {
-        // 云端无数据时，尝试平滑迁移本地缓存历史
+        // 云端无数据时,尝试平滑迁移本地缓存历史
         try {
           const savedHistory = localStorage.getItem('wallet_history');
           if (savedHistory) {
             const parsed = JSON.parse(savedHistory);
             setHistory(parsed);
-            setDoc(docRef, { items: parsed }).catch(console.error);
+            setDoc(ref, { items: parsed }).catch(console.error);
             localStorage.removeItem('wallet_history');
           }
         } catch (e) {}
       }
     }, (err) => console.error("云端同步异常:", err));
-
     return () => unsubscribe();
   }, [user]);
-
-  // Google 登录弹窗
+  // ★ 改动:历史合并迁移(用于"该 Google 账号已存在"的场景)
+  const migrateHistory = async (newUid, localHistory) => {
+    try {
+      const newRef = historyRef(newUid);
+      const newSnap = await getDoc(newRef);
+      const existing = newSnap.exists() ? (newSnap.data().items || []) : [];
+      // 以 address 去重合并:保留较新的 lastQueried 与非空 remark
+      const map = new Map();
+      [...existing, ...localHistory].forEach(item => {
+        if (!item || !item.address) return;
+        const key = item.address.toLowerCase();
+        const prev = map.get(key);
+        if (!prev) {
+          map.set(key, item);
+        } else {
+          map.set(key, {
+            ...prev,
+            ...item,
+            remark: item.remark || prev.remark || '',
+            lastQueried: Math.max(prev.lastQueried || 0, item.lastQueried || 0),
+          });
+        }
+      });
+      const merged = Array.from(map.values())
+        .sort((a, b) => (b.lastQueried || 0) - (a.lastQueried || 0));
+      await setDoc(newRef, { items: merged });
+      // 注:旧匿名账号的孤儿文档因安全规则(uid 不匹配)无法删除,留存无害
+    } catch (e) {
+      console.error('历史迁移失败', e);
+    }
+  };
+  // ★ 改动:Google 登录改为"匿名账号链接升级",保证 UID 不变、历史不丢
   const handleGoogleLogin = async () => {
     try {
       const provider = new GoogleAuthProvider();
+      const current = auth.currentUser;
+      // 情况1:当前是匿名用户 → 用 link 升级,UID 保持不变,历史自动继承
+      if (current && current.isAnonymous) {
+        try {
+          await linkWithPopup(current, provider);
+          return; // 成功:同一 UID,匿名期间的 history 直接归属 Google 账号 ✅
+        } catch (linkErr) {
+          // 情况2:该 Google 账号此前已注册(别处登录过)
+          if (linkErr.code === 'auth/credential-already-in-use') {
+            const cred = GoogleAuthProvider.credentialFromError(linkErr);
+            const pendingHistory = history; // 暂存匿名期间的历史
+            const result = await signInWithCredential(auth, cred);
+            await migrateHistory(result.user.uid, pendingHistory); // 合并进已存在账号
+            return;
+          }
+          throw linkErr;
+        }
+      }
+      // 情况3:没有当前用户(兜底)→ 直接登录
       await signInWithPopup(auth, provider);
     } catch (error) {
-      console.error("Google 登录被取消或失败", error);
+      console.error("Google 登录失败", error);
       if (error.code === 'auth/unauthorized-domain') {
-        setAuthError('沙盒环境的安全策略限制了弹出式登录（当前预览域名未加入白名单）。在您将应用部署到正式域名后即可正常使用。');
+        setAuthError('当前域名未加入 Firebase 授权白名单。请在 Authentication → Settings → Authorized domains 添加你的域名后重试。');
+      } else if (error.code === 'auth/popup-closed-by-user') {
+        setAuthError('登录窗口被关闭,请重试。');
       } else {
-        setAuthError('登录失败，请稍后重试或检查网络环境。');
+        setAuthError('登录失败,请稍后重试或检查网络环境。');
       }
-      // 5秒后自动关闭提示
       setTimeout(() => setAuthError(''), 5000);
     }
   };
-
-  // 退出登录，恢复匿名状态
+  // 退出登录,恢复匿名状态(登出 = 开启新的空白匿名会话,属预期行为)
   const handleLogout = async () => {
     try {
       await signOut(auth);
       await signInAnonymously(auth);
-    } catch (e) {}
+    } catch (e) {
+      console.error('登出失败', e);
+    }
   };
-
   // 检测设备并动态加载扫码库
   useEffect(() => {
     const checkMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
     setIsMobile(checkMobile);
-
     if (checkMobile && !document.getElementById('html5-qrcode-script')) {
       const script = document.createElement('script');
       script.id = 'html5-qrcode-script';
@@ -192,7 +232,6 @@ export default function App() {
       document.head.appendChild(script);
     }
   }, []);
-
   // 构建全局备注字典
   const remarkMap = useMemo(() => {
     const map = {};
@@ -203,13 +242,11 @@ export default function App() {
     });
     return map;
   }, [history]);
-
   const detectChain = (addr) => {
     if (/^0x[a-fA-F0-9]{40}$/.test(addr)) return 'ETH';
     if (/^T[a-zA-Z0-9]{33}$/.test(addr)) return 'TRX';
     return null;
   };
-
   const fetchWalletBalance = async (addr, targetChain) => {
     let native = 0, usdt = 0, price = 0;
     try {
@@ -230,7 +267,6 @@ export default function App() {
         ]);
         native = (accountRes.balance || 0) / 1e6;
         if (accountRes.trc20token_balances) {
-          // 查找 USDT 代币，可能是根据 tokenId 或者是 tokenSymbol
           const usdtToken = accountRes.trc20token_balances.find(t => t.tokenId === 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t' || t.tokenSymbol === 'USDT');
           if (usdtToken) usdt = parseFloat(usdtToken.balance) / Math.pow(10, usdtToken.tokenDecimal || 6);
         }
@@ -239,28 +275,21 @@ export default function App() {
     } catch (e) {
       console.error('获取资产余额失败:', e);
     }
-
     const totalUsd = (native * price) + usdt;
     return { native, usdt, price, totalUsd, chain: targetChain };
   };
-
   const fetchEthData = async (queryAddress, pageNum) => {
     const apiKeyParam = ethApiKey ? `&apikey=${ethApiKey}` : '&apikey=YourApiKeyToken';
     const baseUrl = 'https://api.etherscan.io/api?module=account';
-    
     const [normalRes, tokenRes] = await Promise.all([
       fetch(`${baseUrl}&action=txlist&address=${queryAddress}&startblock=0&endblock=99999999&page=${pageNum}&offset=${FETCH_LIMIT}&sort=desc${apiKeyParam}`),
       fetch(`${baseUrl}&action=tokentx&address=${queryAddress}&startblock=0&endblock=99999999&page=${pageNum}&offset=${FETCH_LIMIT}&sort=desc${apiKeyParam}`)
     ]);
-
     const [normalData, tokenData] = await Promise.all([normalRes.json(), tokenRes.json()]);
-
     if (normalData.status === '0' && normalData.message !== 'No transactions found' && !normalData.result.includes('Rate limit')) {
       throw new Error(`Etherscan API: ${normalData.result}`);
     }
-
     let txs = [];
-    
     if (normalData.status === '1' && Array.isArray(normalData.result)) {
       txs = txs.concat(normalData.result.map(tx => ({
         hash: tx.hash,
@@ -274,7 +303,6 @@ export default function App() {
         explorerUrl: `https://etherscan.io/tx/${tx.hash}`
       })));
     }
-
     if (tokenData.status === '1' && Array.isArray(tokenData.result)) {
       txs = txs.concat(tokenData.result.map(tx => ({
         hash: tx.hash,
@@ -284,38 +312,30 @@ export default function App() {
         amount: formatAmount(tx.value, tx.tokenDecimal),
         symbol: tx.tokenSymbol || 'ERC20',
         type: 'TOKEN',
-        status: '成功', 
+        status: '成功',
         explorerUrl: `https://etherscan.io/tx/${tx.hash}`
       })));
     }
-
     const normalCount = Array.isArray(normalData.result) ? normalData.result.length : 0;
     const tokenCount = Array.isArray(tokenData.result) ? tokenData.result.length : 0;
-
     return { txs, hasMore: normalCount === FETCH_LIMIT || tokenCount === FETCH_LIMIT };
   };
-
   const fetchTrxData = async (queryAddress, pageNum) => {
     const startOffset = (pageNum - 1) * FETCH_LIMIT;
-    
     const [normalRes, tokenRes] = await Promise.all([
       fetch(`https://apilist.tronscanapi.com/api/transaction?sort=-timestamp&count=true&limit=${FETCH_LIMIT}&start=${startOffset}&address=${queryAddress}`),
       fetch(`https://apilist.tronscanapi.com/api/token_trc20/transfers?limit=${FETCH_LIMIT}&start=${startOffset}&sort=-timestamp&count=true&relatedAddress=${queryAddress}`)
     ]);
-
     if (!normalRes.ok || !tokenRes.ok) throw new Error('Tronscan API 请求失败');
-    
     const normalData = await normalRes.json();
     const tokenData = await tokenRes.json();
-
     let txs = [];
     let normalCount = 0;
     let tokenCount = 0;
-
     if (normalData.data && Array.isArray(normalData.data)) {
       normalCount = normalData.data.length;
       txs = txs.concat(normalData.data
-        .filter(tx => tx.amount && parseFloat(tx.amount) > 0) 
+        .filter(tx => tx.amount && parseFloat(tx.amount) > 0)
         .map(tx => ({
           hash: tx.hash,
           timestamp: tx.timestamp,
@@ -328,7 +348,6 @@ export default function App() {
           explorerUrl: `https://tronscan.org/#/transaction/${tx.hash}`
         })));
     }
-
     const trc20List = tokenData.token_transfers || tokenData.data;
     if (trc20List && Array.isArray(trc20List)) {
       tokenCount = trc20List.length;
@@ -336,7 +355,6 @@ export default function App() {
         const tokenInfo = tx.token_info || tx.tokenInfo || {};
         const decimals = tokenInfo.decimals || tokenInfo.tokenDecimal || 6;
         const symbol = tokenInfo.symbol || tokenInfo.tokenAbbr || 'TRC20';
-
         return {
           hash: tx.transaction_id,
           timestamp: tx.block_ts,
@@ -350,14 +368,11 @@ export default function App() {
         };
       }));
     }
-
     return { txs, hasMore: normalCount === FETCH_LIMIT || tokenCount === FETCH_LIMIT };
   };
-
   const handleSearch = async (searchAddress, isLoadMore = false) => {
     const addr = searchAddress.trim();
     if (!addr) return;
-    
     let targetChain = chain;
     if (targetChain === 'AUTO') {
       targetChain = detectChain(addr);
@@ -366,7 +381,6 @@ export default function App() {
         return;
       }
     }
-
     if (!isLoadMore) {
       setLoading(true);
       setFetchingBalance(true);
@@ -378,34 +392,27 @@ export default function App() {
     } else {
       setLoadingMore(true);
     }
-
     const targetApiPage = isLoadMore ? apiPage + 1 : 1;
-
     try {
-      // 异步获取余额信息
       if (!isLoadMore) {
         fetchWalletBalance(addr, targetChain).then(info => {
           setWalletInfo(info);
           setFetchingBalance(false);
         });
       }
-
       let result = { txs: [], hasMore: false };
       if (targetChain === 'ETH') {
         result = await fetchEthData(addr, targetApiPage);
       } else if (targetChain === 'TRX') {
         result = await fetchTrxData(addr, targetApiPage);
       }
-
       const mergedTxs = isLoadMore ? [...allTransactions, ...result.txs] : result.txs;
       const uniqueTxs = Array.from(new Map(mergedTxs.map(item => [item.hash + item.type, item])).values());
       uniqueTxs.sort((a, b) => b.timestamp - a.timestamp);
-      
       setAllTransactions(uniqueTxs);
       setHasMoreData(result.hasMore);
       setApiPage(targetApiPage);
       setCurrentQuery({ address: addr.toLowerCase(), chain: targetChain });
-      
       if (!isLoadMore) {
         setHistory(prev => {
           const existing = prev.find(item => item.address.toLowerCase() === addr.toLowerCase());
@@ -415,12 +422,11 @@ export default function App() {
           } else {
             newHistory = [{ address: addr, chain: targetChain, remark: '', lastQueried: Date.now() }, ...prev];
           }
-          // 保存至云端数据库
-          if (user) setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'wallet_data', 'history'), { items: newHistory }).catch(console.error);
+          // 保存至云端(按当前 UID)
+          if (user) setDoc(historyRef(user.uid), { items: newHistory }).catch(console.error);
           return newHistory;
         });
       }
-      
     } catch (err) {
       if (!isLoadMore) {
         setError(err.message || '查询失败，请检查地址或网络状态。');
@@ -431,7 +437,6 @@ export default function App() {
       setLoadingMore(false);
     }
   };
-
   const jumpToAddress = (targetAddress) => {
     setAddress(targetAddress);
     const detected = detectChain(targetAddress);
@@ -439,24 +444,20 @@ export default function App() {
     handleSearch(targetAddress, false);
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
-
   const handleScan = (scannedText) => {
     const parsedAddress = parseQrAddress(scannedText);
     setShowScanner(false);
     jumpToAddress(parsedAddress);
   };
-
   const saveApiKey = (key) => {
     setEthApiKey(key);
     localStorage.setItem('eth_api_key', key);
     setShowSettings(false);
   };
-
   const filteredTransactions = useMemo(() => {
     return allTransactions.filter(tx => {
       const isOut = tx.from.toLowerCase() === currentQuery.address;
       const isIn = tx.to && tx.to.toLowerCase() === currentQuery.address;
-      
       switch (filterType) {
         case 'IN': return isIn;
         case 'OUT': return isOut;
@@ -466,10 +467,8 @@ export default function App() {
       }
     });
   }, [allTransactions, currentQuery.address, filterType]);
-
   const totalPages = Math.ceil(filteredTransactions.length / PAGE_SIZE) || 1;
   const paginatedTransactions = filteredTransactions.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
-
   return (
     <div className="min-h-screen bg-slate-50 text-slate-800 font-sans selection:bg-indigo-100 selection:text-indigo-900 pb-10">
       <header className="bg-white/80 backdrop-blur-md sticky top-0 z-20 border-b border-slate-200/60 px-4 md:px-6 py-3 md:py-4 flex justify-between items-center shadow-sm">
@@ -483,7 +482,6 @@ export default function App() {
           </div>
         </div>
         <div className="flex items-center gap-2 md:gap-3">
-          {/* 谷歌登录/用户信息面板 */}
           {user && !user.isAnonymous ? (
             <div className="flex items-center gap-2 bg-indigo-50 px-3 py-1.5 rounded-full border border-indigo-100">
               {user.photoURL ? (
@@ -499,8 +497,8 @@ export default function App() {
               <button onClick={handleLogout} className="text-xs text-indigo-400 hover:text-indigo-600 ml-1 font-medium transition-colors">退出</button>
             </div>
           ) : (
-            <button 
-              onClick={handleGoogleLogin} 
+            <button
+              onClick={handleGoogleLogin}
               className="flex items-center gap-1.5 px-3 py-1.5 md:px-4 md:py-2 bg-white border border-slate-200 hover:border-indigo-200 rounded-full shadow-sm text-[12px] md:text-sm font-medium text-slate-600 hover:text-indigo-600 hover:bg-slate-50 transition-all"
             >
               <svg className="w-3.5 h-3.5 md:w-4 md:h-4" viewBox="0 0 24 24">
@@ -512,7 +510,7 @@ export default function App() {
               <span className="hidden sm:inline">登录同步</span>
             </button>
           )}
-          <button 
+          <button
             onClick={() => setShowSettings(true)}
             className="p-2 md:p-2.5 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-full transition-all duration-200"
           >
@@ -520,13 +518,11 @@ export default function App() {
           </button>
         </div>
       </header>
-
-      {/* 登录受限提示弹窗 */}
       {authError && (
         <div className="fixed top-20 right-4 md:right-6 z-[60] p-4 bg-white border-l-4 border-rose-500 rounded-lg shadow-[0_10px_40px_rgba(0,0,0,0.15)] flex items-start gap-3 w-[300px] md:w-[340px] animate-[slideIn_0.3s_ease-out]">
           <AlertCircle className="w-5 h-5 text-rose-500 flex-shrink-0 mt-0.5" />
           <div className="flex-1">
-            <h4 className="text-sm font-bold text-slate-800 mb-1">沙盒登录受限</h4>
+            <h4 className="text-sm font-bold text-slate-800 mb-1">登录提示</h4>
             <p className="text-xs text-slate-500 leading-relaxed">{authError}</p>
           </div>
           <button onClick={() => setAuthError('')} className="p-1 -mr-2 -mt-1 text-slate-400 hover:text-rose-500 transition-colors">
@@ -534,10 +530,7 @@ export default function App() {
           </button>
         </div>
       )}
-
       <div className="max-w-[1400px] mx-auto flex flex-col-reverse lg:flex-row gap-4 md:gap-6 p-4 md:p-6">
-        
-        {}
         <aside className="w-full lg:w-80 flex-shrink-0 flex flex-col gap-4">
           <div className="bg-white rounded-2xl shadow-xl shadow-slate-200/30 border border-slate-100 flex flex-col overflow-hidden max-h-[400px] lg:max-h-none lg:h-[calc(100vh-120px)]">
             <div className="p-4 md:p-5 border-b border-slate-100 flex items-center gap-2 sticky top-0 bg-white z-10">
@@ -552,21 +545,21 @@ export default function App() {
                 </div>
               ) : (
                 history.map((item) => (
-                  <HistoryCard 
-                    key={item.address} 
-                    item={item} 
+                  <HistoryCard
+                    key={item.address}
+                    item={item}
                     onSelect={() => jumpToAddress(item.address)}
                     onUpdateRemark={(addr, rmk) => {
                       setHistory(h => {
                         const newH = h.map(i => i.address === addr ? { ...i, remark: rmk } : i);
-                        if (user) setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'wallet_data', 'history'), { items: newH }).catch(console.error);
+                        if (user) setDoc(historyRef(user.uid), { items: newH }).catch(console.error);
                         return newH;
                       });
                     }}
                     onRemove={(addr) => {
                       setHistory(h => {
                         const newH = h.filter(i => i.address !== addr);
-                        if (user) setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'wallet_data', 'history'), { items: newH }).catch(console.error);
+                        if (user) setDoc(historyRef(user.uid), { items: newH }).catch(console.error);
                         return newH;
                       });
                     }}
@@ -576,12 +569,10 @@ export default function App() {
             </div>
           </div>
         </aside>
-
-        {}
         <main className="flex-1 flex flex-col gap-4 md:gap-6">
           <div className="bg-white rounded-2xl shadow-xl shadow-slate-200/30 border border-slate-100 p-2 md:pl-4 flex flex-col sm:flex-row items-stretch sm:items-center gap-2 focus-within:ring-4 focus-within:ring-indigo-50/50 transition-all">
-            <select 
-              value={chain} 
+            <select
+              value={chain}
               onChange={(e) => setChain(e.target.value)}
               className="px-3 py-3 bg-transparent text-slate-700 font-medium focus:outline-none w-full sm:w-28 cursor-pointer border-b sm:border-b-0 sm:border-r border-slate-200"
             >
@@ -624,15 +615,12 @@ export default function App() {
               {loading ? '检索中...' : '立即查询'}
             </button>
           </div>
-
           {error && (
             <div className="p-3 md:p-4 bg-red-50 text-red-700 border border-red-100 rounded-xl flex items-center gap-2 md:gap-3">
               <AlertCircle className="w-4 h-4 md:w-5 md:h-5 text-red-500 flex-shrink-0" />
               <span className="font-medium text-xs md:text-sm break-all">{error}</span>
             </div>
           )}
-
-          {}
           {currentQuery.address && !error && (
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 md:gap-4 mb-1">
               {fetchingBalance ? (
@@ -652,7 +640,6 @@ export default function App() {
                       ${walletInfo.totalUsd.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                     </div>
                   </div>
-
                   <div className="bg-white border border-slate-100 rounded-2xl p-4 md:p-5 shadow-xl shadow-slate-200/20 flex flex-col justify-between relative overflow-hidden group hover:border-emerald-200 transition-colors">
                     <div className="absolute top-0 right-0 p-4 opacity-5 group-hover:opacity-10 transition-opacity"><DollarSign className="w-16 h-16 text-emerald-500" /></div>
                     <div className="text-slate-500 text-xs md:text-sm font-medium flex items-center gap-1.5 mb-2 relative z-10">
@@ -662,7 +649,6 @@ export default function App() {
                       {walletInfo.usdt.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                     </div>
                   </div>
-
                   <div className="bg-white border border-slate-100 rounded-2xl p-4 md:p-5 shadow-xl shadow-slate-200/20 flex flex-col justify-between relative overflow-hidden group hover:border-blue-200 transition-colors">
                     <div className="absolute top-0 right-0 p-4 opacity-5 group-hover:opacity-10 transition-opacity"><Coins className="w-16 h-16 text-blue-500" /></div>
                     <div className="text-slate-500 text-xs md:text-sm font-medium flex items-center gap-1.5 mb-2 relative z-10">
@@ -676,8 +662,6 @@ export default function App() {
               ) : null}
             </div>
           )}
-
-          {}
           <div className="bg-white rounded-2xl shadow-xl shadow-slate-200/30 border border-slate-100 flex-1 flex flex-col overflow-hidden min-h-[400px] md:min-h-[500px]">
             {currentQuery.address && !error && (
               <div className="px-4 md:px-6 py-3 md:py-4 border-b border-slate-100 flex flex-col gap-3 md:gap-4 bg-slate-50/50">
@@ -690,8 +674,8 @@ export default function App() {
                           key={type}
                           onClick={() => { setFilterType(type); setCurrentPage(1); }}
                           className={`whitespace-nowrap px-3 md:px-4 py-1.5 rounded-full text-[12px] md:text-sm font-medium transition-colors ${
-                            filterType === type 
-                              ? 'bg-slate-800 text-white shadow-sm' 
+                            filterType === type
+                              ? 'bg-slate-800 text-white shadow-sm'
                               : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'
                           }`}
                         >
@@ -707,8 +691,6 @@ export default function App() {
                 </div>
               </div>
             )}
-
-            {}
             <div className="hidden md:block overflow-x-auto flex-1">
               <table className="w-full text-left border-collapse min-w-[900px]">
                 <thead>
@@ -735,8 +717,6 @@ export default function App() {
                 </tbody>
               </table>
             </div>
-
-            {}
             <div className="block md:hidden flex-1 bg-white">
                 <div className="flex flex-col divide-y divide-slate-100">
                   {!currentQuery.address ? (
@@ -752,15 +732,12 @@ export default function App() {
                   )}
                 </div>
             </div>
-            
-            {}
             {currentQuery.address && !loading && totalPages > 0 && (
               <div className="border-t border-slate-100 p-3 md:p-4 flex flex-col sm:flex-row items-center justify-between gap-3 bg-white mt-auto sticky bottom-0 shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.05)]">
                 <div className="flex items-center justify-between w-full sm:w-auto gap-4">
                   <span className="text-[12px] md:text-[13px] font-medium text-slate-500">
                     {currentPage} / {totalPages} 页 (共 {filteredTransactions.length} 条)
                   </span>
-                  
                   {currentPage === totalPages && hasMoreData && (
                     <button
                       onClick={() => handleSearch(currentQuery.address, true)}
@@ -772,7 +749,6 @@ export default function App() {
                     </button>
                   )}
                 </div>
-
                 <div className="flex gap-2 w-full sm:w-auto justify-end">
                   <button
                     onClick={() => { setCurrentPage(p => Math.max(1, p - 1)); window.scrollTo({top: 0, behavior: 'smooth'}); }}
@@ -794,12 +770,10 @@ export default function App() {
           </div>
         </main>
       </div>
-
-      {}
       {showSettings && (
         <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-sm flex items-center justify-center z-50 p-4 animate-in fade-in duration-200">
           <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-5 md:p-6 relative">
-            <button 
+            <button
               onClick={() => setShowSettings(false)}
               className="absolute top-3 right-3 md:top-4 md:right-4 p-2 text-slate-400 hover:text-slate-700 hover:bg-slate-100 rounded-full transition-colors"
             >
@@ -824,7 +798,7 @@ export default function App() {
                   为保障获取主网币与代币(ERC20)数据的稳定性，建议配置 API Key。波场网络默认无限制。
                 </p>
               </div>
-              <button 
+              <button
                 onClick={() => saveApiKey(ethApiKey)}
                 className="w-full bg-slate-900 text-white font-medium py-2.5 md:py-3 rounded-xl hover:bg-slate-800 transition-colors mt-2 md:mt-4 text-sm md:text-base"
               >
@@ -834,72 +808,56 @@ export default function App() {
           </div>
         </div>
       )}
-
-      {/* 扫码弹窗 */}
       {showScanner && (
-        <QrScannerModal 
-          onClose={() => setShowScanner(false)} 
-          onScan={handleScan} 
+        <QrScannerModal
+          onClose={() => setShowScanner(false)}
+          onScan={handleScan}
         />
       )}
     </div>
   );
 }
-
-// 扫码弹窗组件
 function QrScannerModal({ onClose, onScan }) {
   useEffect(() => {
     if (!window.Html5Qrcode) return;
-
     const html5QrCode = new window.Html5Qrcode("qr-reader");
     const config = { fps: 10, qrbox: { width: 250, height: 250 } };
-
     html5QrCode.start(
-      { facingMode: "environment" }, // 使用后置摄像头
+      { facingMode: "environment" },
       config,
       (decodedText) => {
-        // 扫码成功
         html5QrCode.stop().then(() => {
           onScan(decodedText);
         }).catch(err => {
           console.error("停止扫描失败", err);
-          onScan(decodedText); // 即便抛错，也把结果传出去
+          onScan(decodedText);
         });
       },
-      (errorMessage) => {
-        // 忽略扫码过程中未检测到二维码的常规错误
-      }
+      (errorMessage) => {}
     ).catch(err => {
       console.error("启动摄像头失败", err);
       alert("无法访问摄像头，请检查浏览器的摄像头权限设置。");
       onClose();
     });
-
     return () => {
-      // 组件卸载时安全释放摄像头流
       if (html5QrCode.isScanning) {
         html5QrCode.stop().catch(console.error);
       }
     };
   }, [onClose, onScan]);
-
   return (
     <div className="fixed inset-0 bg-black/95 backdrop-blur-sm flex items-center justify-center z-[60] p-4 animate-in fade-in duration-200">
       <div className="w-full max-w-sm flex flex-col items-center">
         <h3 className="text-white text-lg font-bold mb-4">扫描钱包二维码</h3>
-        
         <div className="relative w-full aspect-square bg-slate-900 rounded-2xl overflow-hidden shadow-[0_0_0_4px_rgba(255,255,255,0.15)]">
           <div id="qr-reader" className="w-full h-full object-cover"></div>
-          {/* 自定义扫描线动画 */}
           <div className="absolute top-0 left-0 w-full h-[3px] bg-indigo-500 shadow-[0_0_12px_rgba(99,102,241,1)] animate-[scan_2s_ease-in-out_infinite]"></div>
         </div>
-        
         <p className="text-slate-300 text-sm mt-6 mb-8 text-center leading-relaxed">
           请将二维码对准扫描框内 <br/>
           <span className="text-slate-500 text-xs">支持 ETH 与 TRX 地址</span>
         </p>
-        
-        <button 
+        <button
           onClick={onClose}
           className="p-3.5 bg-white/10 hover:bg-white/20 text-white rounded-full transition-colors backdrop-blur-md"
         >
@@ -915,12 +873,10 @@ function QrScannerModal({ onClose, onScan }) {
     </div>
   );
 }
-
 function AddressDisplay({ address, currentAddress, remarkMap, onAddressClick }) {
   if (!address) return <span>-</span>;
   const isMe = address.toLowerCase() === currentAddress.toLowerCase();
   const remark = remarkMap[address.toLowerCase()];
-
   return (
     <div className="flex flex-col sm:flex-row sm:items-center gap-1.5 flex-wrap">
       {remark && (
@@ -953,12 +909,10 @@ function AddressDisplay({ address, currentAddress, remarkMap, onAddressClick }) 
     </div>
   );
 }
-
 function DesktopTableRow({ tx, currentAddress, remarkMap, onAddressClick }) {
   const isOut = tx.from.toLowerCase() === currentAddress.toLowerCase();
   const isIn = tx.to && tx.to.toLowerCase() === currentAddress.toLowerCase();
   const txDirection = isOut ? 'OUT' : (isIn ? 'IN' : 'OTHER');
-  
   return (
     <tr className="hover:bg-slate-50/80 transition-colors group">
       <td className="px-6 py-4">
@@ -1007,12 +961,10 @@ function DesktopTableRow({ tx, currentAddress, remarkMap, onAddressClick }) {
     </tr>
   );
 }
-
 function MobileTransactionCard({ tx, currentAddress, remarkMap, onAddressClick }) {
   const isOut = tx.from.toLowerCase() === currentAddress.toLowerCase();
   const isIn = tx.to && tx.to.toLowerCase() === currentAddress.toLowerCase();
   const txDirection = isOut ? 'OUT' : (isIn ? 'IN' : 'OTHER');
-
   return (
     <div className="p-4 flex flex-col gap-3 hover:bg-slate-50 transition-colors">
       <div className="flex justify-between items-center">
@@ -1027,7 +979,6 @@ function MobileTransactionCard({ tx, currentAddress, remarkMap, onAddressClick }
           <a href={tx.explorerUrl} target="_blank" rel="noreferrer" className="text-slate-400 active:text-indigo-600"><ExternalLink className="w-4 h-4"/></a>
         </div>
       </div>
-      
       <div className="flex items-center gap-2 py-1">
         {txDirection === 'IN' ? <ArrowDownRight className="w-5 h-5 text-emerald-500" /> : txDirection === 'OUT' ? <ArrowUpRight className="w-5 h-5 text-rose-500" /> : <div className="w-5 h-5" />}
         <span className={`text-xl font-bold tracking-tight ${txDirection === 'IN' ? 'text-emerald-600' : txDirection === 'OUT' ? 'text-rose-600' : 'text-slate-700'}`}>
@@ -1036,7 +987,6 @@ function MobileTransactionCard({ tx, currentAddress, remarkMap, onAddressClick }
         <span className="text-sm font-semibold text-slate-500">{tx.symbol}</span>
         <span className={`ml-auto w-2 h-2 rounded-full ${tx.status === '成功' ? 'bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.5)]' : 'bg-rose-400'}`}></span>
       </div>
-      
       <div className="flex flex-col gap-2.5 bg-slate-50/80 border border-slate-100 p-3 rounded-lg text-[13px]">
         <div className="flex flex-col sm:flex-row justify-between sm:items-center gap-1.5">
           <span className="text-slate-400 text-xs font-medium">FROM</span>
@@ -1050,7 +1000,6 @@ function MobileTransactionCard({ tx, currentAddress, remarkMap, onAddressClick }
     </div>
   );
 }
-
 function EmptyState({ isMobile }) {
   const content = (
     <div className="inline-flex flex-col items-center justify-center text-slate-400">
@@ -1061,12 +1010,10 @@ function EmptyState({ isMobile }) {
   if (isMobile) return <div className="py-20 md:py-32 text-center">{content}</div>;
   return <tr><td colSpan="5" className="px-6 py-20 md:py-32 text-center">{content}</td></tr>;
 }
-
 function NoDataState({ isMobile }) {
   if (isMobile) return <div className="py-16 md:py-24 text-center text-slate-500 text-sm md:text-base">该分类下未找到交易记录</div>;
   return <tr><td colSpan="5" className="px-6 py-16 md:py-24 text-center text-slate-500 text-sm md:text-base">该分类下未找到交易记录</td></tr>;
 }
-
 function LoadingSkeleton({ isMobile }) {
   if (isMobile) {
     return (
@@ -1095,30 +1042,26 @@ function LoadingSkeleton({ isMobile }) {
     </>
   );
 }
-
 function HistoryCard({ item, onSelect, onUpdateRemark, onRemove }) {
   const [isEditing, setIsEditing] = useState(false);
   const [remarkInput, setRemarkInput] = useState(item.remark);
-
   const handleSaveRemark = (e) => {
     e.stopPropagation();
     onUpdateRemark(item.address, remarkInput);
     setIsEditing(false);
   };
-
   return (
-    <div 
+    <div
       className="group bg-white border border-slate-100 rounded-xl p-3 md:p-3.5 hover:border-indigo-300 hover:shadow-md hover:shadow-indigo-100/50 cursor-pointer transition-all relative"
       onClick={onSelect}
     >
-      <button 
+      <button
         onClick={(e) => { e.stopPropagation(); onRemove(item.address); }}
         className="absolute top-2 right-2 md:top-3 md:right-3 p-1.5 bg-rose-50 text-rose-400 hover:text-rose-600 hover:bg-rose-100 rounded-lg opacity-100 md:opacity-0 md:group-hover:opacity-100 transition-all scale-95 md:group-hover:scale-100"
         title="删除记录"
       >
         <X className="w-3.5 h-3.5" />
       </button>
-
       <div className="flex items-center gap-2 mb-2 pr-6">
         <span className={`text-[9px] md:text-[10px] px-1.5 md:px-2 py-0.5 rounded-md font-bold tracking-wider ${item.chain === 'ETH' ? 'bg-blue-100 text-blue-700' : 'bg-red-100 text-red-700'}`}>
           {item.chain}
@@ -1127,7 +1070,6 @@ function HistoryCard({ item, onSelect, onUpdateRemark, onRemove }) {
           {shortenAddress(item.address)}
         </span>
       </div>
-
       <div className="flex items-center mt-2.5 md:mt-3 pt-2.5 md:pt-3 border-t border-slate-50 h-8" onClick={e => e.stopPropagation()}>
         {isEditing ? (
           <div className="flex items-center w-full gap-2">
@@ -1149,7 +1091,7 @@ function HistoryCard({ item, onSelect, onUpdateRemark, onRemove }) {
             <span className={`text-[12px] md:text-[13px] truncate pr-2 md:pr-4 ${item.remark ? 'text-slate-600 font-medium' : 'text-slate-400'}`}>
               {item.remark || '点击添加备注/标签'}
             </span>
-            <button 
+            <button
               onClick={() => setIsEditing(true)}
               className="p-1.5 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg opacity-100 md:opacity-0 md:group-hover/remark:opacity-100 transition-all"
             >
