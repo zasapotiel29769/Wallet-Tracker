@@ -1,5 +1,4 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { Search, History, Settings, ChevronLeft, ChevronRight, Edit2, Check, ExternalLink, Copy, AlertCircle, X, Wallet, ArrowDownRight, ArrowUpRight, Clock, Box, Loader2, DollarSign, Coins, PieChart, Scan } from 'lucide-react';
 
 import { initializeApp } from 'firebase/app';
 import { getAnalytics } from "firebase/analytics";
