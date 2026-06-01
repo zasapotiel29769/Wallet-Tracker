@@ -209,6 +209,7 @@ const hexToBytes = (hex) => {
 const historyRef = (uid) => doc(db, 'artifacts', appId, 'users', uid, 'wallet_data', 'history');
 
 export default function App() {
+  const currentUidRef = useRef(null); 
   const [address, setAddress] = useState('');
   const [chain, setChain] = useState('AUTO');
   const [allTransactions, setAllTransactions] = useState([]);
@@ -264,47 +265,56 @@ export default function App() {
 
   // ============ Auth ============
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
-      if (currentUser) {
-        setUser(currentUser);
+  const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+    // 用户发生变化(登入/登出/换号)→ 先清空界面历史,避免残留串号
+    const prevUid = currentUidRef.current;
+    const newUid = currentUser ? currentUser.uid : null;
+    if (prevUid !== newUid) {
+      setHistory([]);
+      setCurrentQuery({ address: '', chain: '' });
+      setAllTransactions([]);
+      setWalletInfo(null);
+      setSingleTx(null);
+    }
+    currentUidRef.current = newUid;
+
+    if (currentUser) {
+      setUser(currentUser);
+    } else {
+      setUser(null);
+      if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+        signInWithCustomToken(auth, __initial_auth_token).catch((e) => console.error('token 登录失败', e));
       } else {
-        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-          signInWithCustomToken(auth, __initial_auth_token).catch((e) => console.error('token 登录失败', e));
-        } else {
-          signInAnonymously(auth).catch((e) => console.error('匿名登录失败', e));
-        }
+        signInAnonymously(auth).catch((e) => console.error('匿名登录失败', e));
       }
-    });
-    return () => unsubscribe();
-  }, []);
+    }
+  });
+  return () => unsubscribe();
+}, []);
+
 
   // ============ 历史同步 ============
-  useEffect(() => {
-    try {
-      const savedKey = localStorage.getItem('eth_api_key');
-      if (savedKey) setEthApiKey(savedKey);
-      const savedTrxKey = localStorage.getItem('trx_api_key');
-      if (savedTrxKey) setTrxApiKey(savedTrxKey);
-    } catch (e) {}
+ useEffect(() => {
+  try {
+    const savedKey = localStorage.getItem('eth_api_key');
+    if (savedKey) setEthApiKey(savedKey);
+    const savedTrxKey = localStorage.getItem('trx_api_key');
+    if (savedTrxKey) setTrxApiKey(savedTrxKey);
+  } catch (e) {}
 
-    if (!user) return;
-    const ref = historyRef(user.uid);
-    const unsub = onSnapshot(ref, (snap) => {
-      if (snap.exists()) setHistory(snap.data().items || []);
-      else {
-        try {
-          const local = localStorage.getItem('wallet_history');
-          if (local) {
-            const parsed = JSON.parse(local);
-            setHistory(parsed);
-            setDoc(ref, { items: cleanForFirestore(parsed) }).catch(console.error);
-            localStorage.removeItem('wallet_history');
-          }
-        } catch (e) {}
-      }
-    }, (err) => console.error('云端同步异常', err));
-    return () => unsub();
-  }, [user]);
+  if (!user) { setHistory([]); return; }
+
+  const uid = user.uid;
+  const ref = historyRef(uid);
+  const unsub = onSnapshot(ref, (snap) => {
+    // 只接受当前用户的数据,防止快照回调晚于切号造成串记录
+    if (currentUidRef.current !== uid) return;
+    if (snap.exists()) setHistory(snap.data().items || []);
+    else setHistory([]);
+  }, (err) => console.error('云端同步异常', err));
+  return () => unsub();
+}, [user]);
+
 
   const migrateHistory = async (newUid, localHistory) => {
     try {
@@ -358,9 +368,26 @@ export default function App() {
   };
 
   const handleLogout = async () => {
-    try { await signOut(auth); await signInAnonymously(auth); }
-    catch (e) { console.error('登出失败', e); }
-  };
+  try {
+    // 立即清空界面,不等异步
+    setHistory([]);
+    setCurrentQuery({ address: '', chain: '' });
+    setAllTransactions([]);
+    setWalletInfo(null);
+    setSingleTx(null);
+    await signOut(auth);
+    await signInAnonymously(auth);
+  } catch (e) { console.error('登出失败', e); }
+};
+
+// 安全写入:仅当目标 uid 仍是当前用户时才写,防串号
+const safeWriteHistory = (items) => {
+  const uid = user?.uid;
+  if (!uid || currentUidRef.current !== uid) return;
+  setDoc(historyRef(uid), { items: cleanForFirestore(items) }).catch(console.error);
+};
+
+
 
   // ============ 设备检测 + 扫码库 ============
   useEffect(() => {
@@ -604,7 +631,8 @@ export default function App() {
           let nh;
           if (exist) nh = [{ ...exist, lastQueried: Date.now(), ens: ensName || exist.ens || null }, ...prev.filter(i => i.address.toLowerCase() !== addr.toLowerCase())];
           else nh = [{ address: addr, chain: targetChain, remark: '', ens: ensName || null, lastQueried: Date.now() }, ...prev];
-          if (user) setDoc(historyRef(user.uid), { items: cleanForFirestore(nh) }).catch(console.error);
+        //   if (user) setDoc(historyRef(user.uid), { items: cleanForFirestore(nh) }).catch(console.error);
+        safeWriteHistory(nh); 
           return nh;
         });
       }
@@ -637,7 +665,8 @@ export default function App() {
   const updateRemark = (addr, rmk) => {
     setHistory((h) => {
       const nh = h.map(i => i.address === addr ? { ...i, remark: rmk } : i);
-      if (user) setDoc(historyRef(user.uid), { items: cleanForFirestore(nh) }).catch(console.error);
+      safeWriteHistory(nh); 
+    //   if (user) setDoc(historyRef(user.uid), { items: cleanForFirestore(nh) }).catch(console.error);
       return nh;
     });
   };
@@ -645,7 +674,8 @@ export default function App() {
   const removeHistory = (addr) => {
     setHistory((h) => {
       const nh = h.filter(i => i.address !== addr);
-      if (user) setDoc(historyRef(user.uid), { items: cleanForFirestore(nh) }).catch(console.error);
+       safeWriteHistory(nh);
+    //   if (user) setDoc(historyRef(user.uid), { items: cleanForFirestore(nh) }).catch(console.error);
       return nh;
     });
   };
@@ -1218,30 +1248,35 @@ function HistoryCard({ item, onSelect, onUpdateRemark, onRemove }) {
     <div onClick={onSelect}
       className="group bg-slate-50 dark:bg-white/5 hover:bg-[#AB9FF2]/10 border border-transparent hover:border-[#AB9FF2]/30 rounded-xl p-3 cursor-pointer transition-all relative">
       <button onClick={(e) => { e.stopPropagation(); onRemove(item.address); }}
-        className="absolute top-2 right-2 p-1 text-slate-300 hover:text-rose-500 opacity-0 group-hover:opacity-100 transition-opacity">
-        <Trash2 className="w-3.5 h-3.5" />
+        className="absolute top-2.5 right-2.5 p-1.5 rounded-lg text-slate-400 hover:text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-500/10 transition-colors"
+        title="删除记录">
+        <Trash2 className="w-4 h-4" />
       </button>
-      <div className="flex items-center gap-2 mb-1 pr-5">
+      <div className="flex items-center gap-2 mb-2 pr-8">
         <span className={`text-[9px] px-1.5 py-0.5 rounded font-bold ${item.chain === 'ETH' ? 'bg-blue-100 text-blue-700' : 'bg-red-100 text-red-700'}`}>{item.chain}</span>
         <span className="font-mono text-xs font-medium truncate">{item.ens || shortenAddress(item.address)}</span>
       </div>
       <div onClick={e => e.stopPropagation()}>
         {editing ? (
-          <div className="flex items-center gap-1.5 mt-1">
+          <div className="flex items-center gap-1.5">
             <input autoFocus value={val} onChange={e => setVal(e.target.value)} onKeyDown={e => e.key === 'Enter' && save(e)}
-              placeholder="输入标签" className="flex-1 text-xs px-2 py-1 rounded-lg bg-white dark:bg-white/10 border border-[#AB9FF2]/40 focus:outline-none" />
-            <button onClick={save} className="p-1 text-emerald-500"><Check className="w-3.5 h-3.5" /></button>
+              placeholder="输入备注/标签" className="flex-1 text-xs px-2 py-1.5 rounded-lg bg-white dark:bg-white/10 border border-[#AB9FF2]/40 focus:outline-none" />
+            <button onClick={save} className="p-1.5 rounded-lg text-emerald-500 hover:bg-emerald-50 dark:hover:bg-emerald-500/10"><Check className="w-4 h-4" /></button>
           </div>
         ) : (
-          <div className="flex items-center justify-between">
-            <span className={`text-xs truncate ${item.remark ? 'text-slate-600 dark:text-slate-300' : 'text-slate-400'}`}>{item.remark || '点击添加备注'}</span>
-            <button onClick={() => setEditing(true)} className="p-1 text-slate-300 hover:text-[#AB9FF2] opacity-0 group-hover:opacity-100"><Edit2 className="w-3 h-3" /></button>
-          </div>
+          <button onClick={() => setEditing(true)}
+            className="w-full flex items-center justify-between gap-2 text-left group/edit">
+            <span className={`text-xs truncate ${item.remark ? 'text-slate-600 dark:text-slate-300 font-medium' : 'text-slate-400'}`}>
+              {item.remark || '点击添加备注/标签'}
+            </span>
+            <Edit2 className="w-3.5 h-3.5 text-slate-400 group-hover/edit:text-[#AB9FF2] flex-shrink-0" />
+          </button>
         )}
       </div>
     </div>
   );
 }
+
 
 // ============ 移动端历史列表 ============
 function MobileHistoryList({ history, onJump, onUpdateRemark, onRemove }) {
