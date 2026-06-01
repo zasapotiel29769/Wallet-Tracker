@@ -208,6 +208,15 @@ const hexToBytes = (hex) => {
 
 const historyRef = (uid) => doc(db, 'artifacts', appId, 'users', uid, 'wallet_data', 'history');
 
+// 清除对象里的 undefined,避免 Firestore 报错
+const cleanForFirestore = (items) =>
+  items.map(item => {
+    const o = {};
+    Object.keys(item).forEach(k => { if (item[k] !== undefined) o[k] = item[k]; });
+    return o;
+  });
+
+
 export default function App() {
   const [address, setAddress] = useState('');
   const [chain, setChain] = useState('AUTO');
@@ -563,11 +572,28 @@ export default function App() {
   };
 
   const doSearch = async (addr, targetChain, isLoadMore, ensName = null) => {
-    if (!isLoadMore) {
-      setLoading(true); setFetchingBalance(true); setWalletInfo(null);
-      setError(null); setFilterType('ALL'); setCurrentPage(1); setApiPage(1);
-      setActiveTab('search');
-    } else setLoadingMore(true);
+      
+      if (!isLoadMore) {
+          setHistory((prev) => {
+            const exist = prev.find(i => i.address.toLowerCase() === addr.toLowerCase());
+            let nh;
+            if (exist) {
+              nh = [
+                { ...exist, lastQueried: Date.now(), ens: ensName || exist.ens || null },
+                ...prev.filter(i => i.address.toLowerCase() !== addr.toLowerCase())
+              ];
+            } else {
+              nh = [
+                { address: addr, chain: targetChain, remark: '', ens: ensName || null, lastQueried: Date.now() },
+                ...prev
+              ];
+            }
+            if (user) setDoc(historyRef(user.uid), { items: cleanForFirestore(nh) }).catch(console.error);
+            return nh;
+          });
+        }
+
+     
 
     const targetApiPage = isLoadMore ? apiPage + 1 : 1;
     try {
@@ -594,7 +620,7 @@ export default function App() {
           let nh;
           if (exist) nh = [{ ...exist, lastQueried: Date.now(), ens: ensName || exist.ens }, ...prev.filter(i => i.address.toLowerCase() !== addr.toLowerCase())];
           else nh = [{ address: addr, chain: targetChain, remark: '', ens: ensName, lastQueried: Date.now() }, ...prev];
-          if (user) setDoc(historyRef(user.uid), { items: nh }).catch(console.error);
+          if (user) setDoc(historyRef(user.uid), { items: cleanForFirestore(nh) }).catch(console.error);
           return nh;
         });
       }
@@ -625,7 +651,7 @@ export default function App() {
   const updateRemark = (addr, rmk) => {
     setHistory((h) => {
       const nh = h.map(i => i.address === addr ? { ...i, remark: rmk } : i);
-      if (user) setDoc(historyRef(user.uid), { items: nh }).catch(console.error);
+      if (user) setDoc(historyRef(user.uid), { items: cleanForFirestore(nh) }).catch(console.error);
       return nh;
     });
   };
@@ -633,7 +659,7 @@ export default function App() {
   const removeHistory = (addr) => {
     setHistory((h) => {
       const nh = h.filter(i => i.address !== addr);
-      if (user) setDoc(historyRef(user.uid), { items: nh }).catch(console.error);
+      if (user) setDoc(historyRef(user.uid), { items: cleanForFirestore(nh) }).catch(console.error);
       return nh;
     });
   };
