@@ -5,7 +5,7 @@
  * 2. iOS左滑操作（历史+查询界面）
  * 3. 税务报表（按月/季度/年）
  */
-
+import React from 'react';
 import { initializeApp } from 'firebase/app';
 import { getAnalytics } from 'firebase/analytics';
 import { getAuth, onAuthStateChanged, signInWithPopup, GoogleAuthProvider, signInWithCredential, 
