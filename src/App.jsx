@@ -1,18 +1,22 @@
-/**
- * CryptoInsight - Web3 交易查询工具 (增强版)
- * 新增功能：
- * 1. 交易后余额显示（TRX/USDT/USD）
- * 2. iOS左滑操作（历史+查询界面）
- * 3. 税务报表（按月/季度/年）
- */
-import React from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { initializeApp } from 'firebase/app';
 import { getAnalytics } from 'firebase/analytics';
-import { getAuth, onAuthStateChanged, signInWithPopup, GoogleAuthProvider, signInWithCredential, 
-         signInAnonymously, signOut, linkWithPopup } from 'firebase/auth';
-import { getFirestore, doc, setDoc, getDoc, onSnapshot } from 'firebase/firestore';
+import {
+  getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged,
+  GoogleAuthProvider, signInWithPopup, signOut,
+  linkWithPopup, signInWithCredential,
+} from 'firebase/auth';
+import {
+  getFirestore, doc, onSnapshot, setDoc, getDoc,
+} from 'firebase/firestore';
+import {
+  Wallet, Settings, History, Search, Scan, Loader2, AlertCircle, X,
+  DollarSign, ChevronLeft, ChevronRight, Clock, ArrowDownRight, ArrowUpRight,
+  Copy, ExternalLink, Check, Edit2, Sun, Moon, Monitor, Image as ImageIcon,
+  LogOut, Eye, EyeOff, Trash2, FileText, Network, Calculator, Download, Calendar,
+} from 'lucide-react';
 
-// ============ Firebase 配置 ============
+// ⚠️ 换回你自己的 firebaseConfig
 const firebaseConfig = {
   apiKey: "AIzaSyBfLcdkM6CntqcPbOX42p8QXwmpsHnaKAs",
   authDomain: "wallet-checker-34d3d.firebaseapp.com",
@@ -35,12 +39,20 @@ const ENS_RPC = 'https://cloudflare-eth.com';
 
 // ============ 工具函数 ============
 const shortenAddress = (a) => (!a ? '' : `${a.slice(0, 6)}...${a.slice(-4)}`);
+const shortenHash = (h) => (!h ? '' : `${h.slice(0, 10)}...${h.slice(-8)}`);
 
 const formatTime = (ts) => {
   if (!ts) return '';
   return new Date(parseInt(ts)).toLocaleString('zh-CN', {
     month: '2-digit', day: '2-digit',
     hour: '2-digit', minute: '2-digit', second: '2-digit',
+  });
+};
+
+const formatDate = (ts) => {
+  if (!ts) return '';
+  return new Date(parseInt(ts)).toLocaleDateString('zh-CN', {
+    year: 'numeric', month: '2-digit', day: '2-digit',
   });
 };
 
@@ -56,16 +68,11 @@ const copyToClipboard = (text) => {
 };
 
 const formatAmount = (value, decimals = 18) => {
-  if (!value && value !== 0) return '0';
+  if (!value) return '0';
   const num = parseFloat(value) / Math.pow(10, parseInt(decimals || 18));
   if (num === 0) return '0';
   if (num < 0.000001) return '<0.000001';
   return num.toLocaleString('en-US', { maximumFractionDigits: 6 });
-};
-
-const formatCurrency = (value, decimals = 2) => {
-  if (!value && value !== 0) return '$0.00';
-  return '$' + parseFloat(value).toLocaleString('en-US', { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
 };
 
 const parseQrAddress = (text) => {
@@ -206,289 +213,22 @@ const hexToBytes = (hex) => {
 
 const historyRef = (uid) => doc(db, 'artifacts', appId, 'users', uid, 'wallet_data', 'history');
 
-// ============ 计算交易后余额 ============
-const calculateBalancesAfterTx = (txs, currentNative, currentUsdt, price) => {
-  if (!txs || txs.length === 0) return [];
+// ============ 时间工具函数 ============
+const getTimeRangeOptions = () => {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = now.getMonth();
   
-  // 按时间正序排列（从早到晚）
-  const sortedTxs = [...txs].sort((a, b) => a.timestamp - b.timestamp);
-  
-  let runningNative = 0;
-  let runningUsdt = 0;
-  const results = [];
-  
-  // 从最后一笔交易开始往后推算当前余额
-  for (let i = sortedTxs.length - 1; i >= 0; i--) {
-    const tx = sortedTxs[i];
-    const isOut = tx.from?.toLowerCase() === tx.currentAddress?.toLowerCase();
-    const isIn = tx.to && tx.to.toLowerCase() === tx.currentAddress?.toLowerCase();
-    
-    if (tx.type === 'NATIVE' || !tx.type) {
-      // 原生币交易
-      const amount = parseFloat(tx.amountRaw || tx.amountRaw === 0 ? tx.amountRaw : tx.amount.replace(/,/g, ''));
-      if (isOut) {
-        runningNative += amount;
-      } else if (isIn) {
-        runningNative -= amount;
-      }
-    } else if (tx.type === 'TOKEN') {
-      // 代币交易（主要是USDT）
-      const amount = parseFloat(tx.amountRaw || tx.amountRaw === 0 ? tx.amountRaw : tx.amount.replace(/,/g, ''));
-      if (tx.symbol === 'USDT' || tx.symbol === 'TRC20-USDT') {
-        if (isOut) {
-          runningUsdt += amount;
-        } else if (isIn) {
-          runningUsdt -= amount;
-        }
-      }
-    }
-    
-    // 记录这笔交易执行后的余额
-    results.unshift({
-      ...tx,
-      afterNative: currentNative - runningNative,
-      afterUsdt: currentUsdt - runningUsdt,
-      afterUsd: (currentNative - runningNative) * price + (currentUsdt - runningUsdt)
-    });
-  }
-  
-  return results;
-};
-
-// ============ 税务报表计算 ============
-const calculateTaxReport = (txs, startDate, endDate) => {
-  const filtered = txs.filter(tx => {
-    const ts = tx.timestamp;
-    return ts >= startDate && ts <= endDate;
-  });
-
-  let totalBuyNative = 0;
-  let totalSellNative = 0;
-  let totalBuyUsdt = 0;
-  let totalSellUsdt = 0;
-  let totalTransferIn = 0;
-  let totalTransferOut = 0;
-  let transactionCount = 0;
-  let gasFees = 0;
-
-  const buyTxs = [];
-  const sellTxs = [];
-  const transferTxs = [];
-
-  filtered.forEach(tx => {
-    const amount = parseFloat(tx.amountRaw || tx.amount.replace(/,/g, '')) || 0;
-    const isOut = tx.from?.toLowerCase() === tx.currentAddress?.toLowerCase();
-    const isIn = tx.to && tx.to.toLowerCase() === tx.currentAddress?.toLowerCase();
-
-    if (tx.type === 'NATIVE' || !tx.type) {
-      if (isIn) {
-        totalBuyNative += amount;
-        buyTxs.push(tx);
-      } else if (isOut) {
-        totalSellNative += amount;
-        sellTxs.push(tx);
-      }
-      // 估算Gas费（简单处理）
-      if (tx.gasFee) gasFees += parseFloat(tx.gasFee);
-    } else if (tx.type === 'TOKEN') {
-      if (tx.symbol === 'USDT' || tx.symbol === 'TRC20-USDT') {
-        if (isIn) {
-          totalBuyUsdt += amount;
-          buyTxs.push(tx);
-        } else if (isOut) {
-          totalSellUsdt += amount;
-          sellTxs.push(tx);
-        }
-      } else {
-        // 其他代币计入转账
-        if (isIn) {
-          totalTransferIn += amount;
-          transferTxs.push({ ...tx, direction: 'in' });
-        } else if (isOut) {
-          totalTransferOut += amount;
-          transferTxs.push({ ...tx, direction: 'out' });
-        }
-      }
-    } else {
-      // 无法判断类型，算作转账
-      if (isIn) {
-        totalTransferIn += amount;
-        transferTxs.push({ ...tx, direction: 'in' });
-      } else if (isOut) {
-        totalTransferOut += amount;
-        transferTxs.push({ ...tx, direction: 'out' });
-      }
-    }
-    transactionCount++;
-  });
-
-  // 计算盈亏（简化版：基于买卖差）
-  const netNative = totalBuyNative - totalSellNative;
-  const netUsdt = totalBuyUsdt - totalSellUsdt;
-
   return {
-    period: { start: startDate, end: endDate },
-    summary: {
-      transactionCount,
-      totalBuyNative,
-      totalSellNative,
-      netNative,
-      totalBuyUsdt,
-      totalSellUsdt,
-      netUsdt,
-      totalTransferIn,
-      totalTransferOut,
-      gasFees,
-      realizedPnL: 0, // 需要价格数据才能计算
-    },
-    transactions: {
-      buy: buyTxs,
-      sell: sellTxs,
-      transfer: transferTxs
-    }
+    currentMonth: { label: '本月', start: new Date(year, month, 1), end: new Date(year, month + 1, 0, 23, 59, 59) },
+    lastMonth: { label: '上月', start: new Date(year, month - 1, 1), end: new Date(year, month, 0, 23, 59, 59) },
+    currentQuarter: { label: '本季度', start: new Date(year, Math.floor(month / 3) * 3, 1), end: now },
+    lastQuarter: { label: '上季度', start: new Date(year, Math.floor(month / 3) * 3 - 3, 1), end: new Date(year, Math.floor(month / 3) * 3, 0, 23, 59, 59) },
+    currentYear: { label: '今年', start: new Date(year, 0, 1), end: now },
+    lastYear: { label: '去年', start: new Date(year - 1, 0, 1), end: new Date(year - 1, 11, 31, 23, 59, 59) },
   };
 };
 
-// ============ 导出CSV ============
-const exportTaxReportCSV = (report, address, chain) => {
-  const headers = ['日期时间', '交易哈希', '类型', '方向', '代币', '金额', '状态', 'Gas费', '链接'];
-  const rows = [];
-  
-  [...report.transactions.buy, ...report.transactions.sell, ...report.transactions.transfer]
-    .sort((a, b) => a.timestamp - b.timestamp)
-    .forEach(tx => {
-      const isIn = tx.direction === 'in' || tx.to?.toLowerCase() === address.toLowerCase();
-      const isOut = tx.direction === 'out' || tx.from?.toLowerCase() === address.toLowerCase();
-      
-      rows.push([
-        new Date(tx.timestamp).toLocaleString('zh-CN'),
-        tx.hash,
-        tx.type || 'NATIVE',
-        isIn ? '转入' : isOut ? '转出' : '未知',
-        tx.symbol || 'ETH/TRX',
-        tx.amount,
-        tx.status || '成功',
-        tx.gasFee || '-',
-        tx.explorerUrl || ''
-      ]);
-    });
-
-  const csvContent = [headers, ...rows].map(row => row.map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(',')).join('\n');
-  const BOM = '\uFEFF';
-  const blob = new Blob([BOM + csvContent], { type: 'text/csv;charset=utf-8' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `tax_report_${chain}_${address.slice(0, 8)}_${new Date().toISOString().slice(0,10)}.csv`;
-  a.click();
-  URL.revokeObjectURL(url);
-};
-
-// ============ 左滑操作组件 ============
-function SwipeAction({ children, onEdit, onDelete, editLabel = '编辑', deleteLabel = '删除' }) {
-  const [offset, setOffset] = useState(0);
-  const [startX, setStartX] = useState(0);
-  const [startOffset, setStartOffset] = useState(0);
-  const [isSwipeOpen, setIsSwipeOpen] = useState(false);
-  const containerRef = useRef(null);
-
-  const handleTouchStart = (e) => {
-    setStartX(e.touches[0].clientX);
-    setStartOffset(offset);
-    setIsSwipeOpen(false);
-  };
-
-  const handleTouchMove = (e) => {
-    const currentX = e.touches[0].clientX;
-    const diff = startX - currentX;
-    let newOffset = startOffset - diff;
-    
-    // 限制滑动范围
-    if (diff > 0) {
-      newOffset = Math.min(newOffset, 160); // 最大滑动距离（两个按钮）
-    } else {
-      newOffset = Math.max(newOffset, 0);
-    }
-    
-    setOffset(newOffset);
-  };
-
-  const handleTouchEnd = () => {
-    if (offset > 80) {
-      setOffset(160);
-      setIsSwipeOpen(true);
-    } else {
-      setOffset(0);
-      setIsSwipeOpen(false);
-    }
-  };
-
-  const handleClose = () => {
-    setOffset(0);
-    setIsSwipeOpen(false);
-  };
-
-  const handleEdit = () => {
-    if (onEdit) onEdit();
-    handleClose();
-  };
-
-  const handleDelete = () => {
-    if (onDelete) onDelete();
-    handleClose();
-  };
-
-  // 点击外部关闭
-  useEffect(() => {
-    if (!isSwipeOpen) return;
-    const handleClickOutside = (e) => {
-      if (containerRef.current && !containerRef.current.contains(e.target)) {
-        handleClose();
-      }
-    };
-    document.addEventListener('click', handleClickOutside);
-    return () => document.removeEventListener('click', handleClickOutside);
-  }, [isSwipeOpen]);
-
-  return (
-    <div ref={containerRef} className="relative overflow-hidden">
-      {/* 滑动按钮层 */}
-      <div className="absolute right-0 top-0 bottom-0 flex items-center">
-        <button
-          onClick={handleEdit}
-          className="h-full w-20 bg-amber-500 text-white flex items-center justify-center text-sm font-medium active:bg-amber-600"
-        >
-          <div className="flex flex-col items-center">
-            <Edit2 className="w-5 h-5 mb-1" />
-            <span>{editLabel}</span>
-          </div>
-        </button>
-        <button
-          onClick={handleDelete}
-          className="h-full w-20 bg-rose-500 text-white flex items-center justify-center text-sm font-medium active:bg-rose-600"
-        >
-          <div className="flex flex-col items-center">
-            <Trash2 className="w-5 h-5 mb-1" />
-            <span>{deleteLabel}</span>
-          </div>
-        </button>
-      </div>
-      
-      {/* 内容层 */}
-      <div
-        className="relative bg-white dark:bg-[#13111C] transition-transform"
-        style={{ transform: `translateX(-${offset}px)` }}
-        onTouchStart={handleTouchStart}
-        onTouchMove={handleTouchMove}
-        onTouchEnd={handleTouchEnd}
-      >
-        {children}
-      </div>
-    </div>
-  );
-}
-
-// ============ 主应用 ============
 export default function App() {
   const currentUidRef = useRef(null); 
   const [address, setAddress] = useState('');
@@ -511,26 +251,14 @@ export default function App() {
   const [showScanner, setShowScanner] = useState(false);
   const [user, setUser] = useState(null);
   const [authError, setAuthError] = useState('');
+  const [showTaxReport, setShowTaxReport] = useState(false);
 
   const [theme, setTheme] = useState('dark');
   const [activeTab, setActiveTab] = useState('search');
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [singleTx, setSingleTx] = useState(null);
   const [showKey, setShowKey] = useState(false);
-  
-  // 新增：税务报表相关
-  const [showTaxReport, setShowTaxReport] = useState(false);
-  const [taxReportData, setTaxReportData] = useState(null);
-  const [taxPeriodType, setTaxPeriodType] = useState('month'); // month/quarter/year
-  const [taxCustomStart, setTaxCustomStart] = useState('');
-  const [taxCustomEnd, setTaxCustomEnd] = useState('');
-  const [txsWithBalances, setTxsWithBalances] = useState([]);
-  
-  // 新增：编辑备注弹窗
-  const [editingRemark, setEditingRemark] = useState({ address: '', remark: '', ens: '' });
-  const [showRemarkModal, setShowRemarkModal] = useState(false);
 
-  // ============ 主题 ============
   useEffect(() => {
     const saved = localStorage.getItem('theme') || 'dark';
     setTheme(saved);
@@ -556,7 +284,6 @@ export default function App() {
     }
   }, [theme]);
 
-  // ============ Auth ============
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
       const prevUid = currentUidRef.current;
@@ -567,7 +294,6 @@ export default function App() {
         setAllTransactions([]);
         setWalletInfo(null);
         setSingleTx(null);
-        setTxsWithBalances([]);
       }
       currentUidRef.current = newUid;
 
@@ -585,7 +311,6 @@ export default function App() {
     return () => unsubscribe();
   }, []);
 
-  // ============ 历史同步 ============
   useEffect(() => {
     try {
       const savedKey = localStorage.getItem('eth_api_key');
@@ -650,9 +375,9 @@ export default function App() {
       await signInWithPopup(auth, provider);
     } catch (error) {
       console.error('Google 登录失败', error);
-      if (error.code === 'auth/unauthorized-domain') setAuthError('当前域名未加入 Firebase 授权白名单');
-      else if (error.code === 'auth/popup-closed-by-user') setAuthError('登录窗口被关闭');
-      else setAuthError('登录失败');
+      if (error.code === 'auth/unauthorized-domain') setAuthError('当前域名未加入 Firebase 授权白名单,请在 Authentication → Settings → Authorized domains 添加后重试。');
+      else if (error.code === 'auth/popup-closed-by-user') setAuthError('登录窗口被关闭,请重试。');
+      else setAuthError('登录失败,请稍后重试或检查网络环境。');
       setTimeout(() => setAuthError(''), 5000);
     }
   };
@@ -664,7 +389,6 @@ export default function App() {
       setAllTransactions([]);
       setWalletInfo(null);
       setSingleTx(null);
-      setTxsWithBalances([]);
       await signOut(auth);
       await signInAnonymously(auth);
     } catch (e) { console.error('登出失败', e); }
@@ -676,7 +400,6 @@ export default function App() {
     setDoc(historyRef(uid), { items: cleanForFirestore(items) }).catch(console.error);
   };
 
-  // ============ 设备检测 ============
   useEffect(() => {
     const checkMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
     setIsMobile(checkMobile);
@@ -706,12 +429,11 @@ export default function App() {
     if (trxApiKey) headers['TRON-PRO-API-KEY'] = trxApiKey;
     const res = await fetch(url, { headers });
     if (res.status === 429) {
-      throw new Error('请求过于频繁');
+      throw new Error('Tronscan 接口请求过于频繁,请稍候再试,或在设置中配置 TRON API Key 提高限额。');
     }
     return res;
   };
 
-  // ============ 余额 ============
   const fetchWalletBalance = async (addr, targetChain) => {
     let native = 0, usdt = 0, price = 0;
     try {
@@ -742,7 +464,6 @@ export default function App() {
     return { native, usdt, price, totalUsd, chain: targetChain };
   };
 
-  // ============ ETH 交易 ============
   const fetchEthData = async (q, pageNum) => {
     const k = ethApiKey ? `&apikey=${ethApiKey}` : '&apikey=YourApiKeyToken';
     const base = 'https://api.etherscan.io/api?module=account';
@@ -759,17 +480,16 @@ export default function App() {
       txs = txs.concat(nD.result.map(tx => ({
         hash: tx.hash, timestamp: parseInt(tx.timeStamp) * 1000,
         from: tx.from, to: tx.to, amount: formatAmount(tx.value, 18),
-        amountRaw: parseFloat(tx.value) / 1e18,
+        rawAmount: tx.value, decimals: 18,
         symbol: 'ETH', type: 'NATIVE', status: tx.isError === '0' ? '成功' : '失败',
         explorerUrl: `https://etherscan.io/tx/${tx.hash}`,
-        gasFee: tx.gasUsed ? formatAmount(parseInt(tx.gasUsed) * parseInt(tx.gasPrice), 18) : null,
       })));
     }
     if (tD.status === '1' && Array.isArray(tD.result)) {
       txs = txs.concat(tD.result.map(tx => ({
         hash: tx.hash, timestamp: parseInt(tx.timeStamp) * 1000,
         from: tx.from, to: tx.to, amount: formatAmount(tx.value, tx.tokenDecimal),
-        amountRaw: parseFloat(tx.value) / Math.pow(10, tx.tokenDecimal),
+        rawAmount: tx.value, decimals: tx.tokenDecimal,
         symbol: tx.tokenSymbol || 'ERC20', type: 'TOKEN', status: '成功',
         explorerUrl: `https://etherscan.io/tx/${tx.hash}`,
       })));
@@ -779,7 +499,6 @@ export default function App() {
     return { txs, hasMore: nc === FETCH_LIMIT || tc === FETCH_LIMIT };
   };
 
-  // ============ TRX 交易 ============
   const fetchTrxData = async (q, pageNum) => {
     const start = (pageNum - 1) * FETCH_LIMIT;
     const [nR, tR] = await Promise.all([
@@ -794,10 +513,10 @@ export default function App() {
       nc = nD.data.length;
       txs = txs.concat(nD.data.filter(tx => tx.amount && parseFloat(tx.amount) > 0).map(tx => ({
         hash: tx.hash, timestamp: tx.timestamp, from: tx.ownerAddress, to: tx.toAddress,
-        amount: formatAmount(tx.amount, 6), amountRaw: parseFloat(tx.amount) / 1e6,
-        symbol: 'TRX', type: 'NATIVE', status: tx.contractRet === 'SUCCESS' ? '成功' : '失败',
+        amount: formatAmount(tx.amount, 6), rawAmount: tx.amount, decimals: 6,
+        symbol: 'TRX', type: 'NATIVE',
+        status: tx.contractRet === 'SUCCESS' ? '成功' : '失败',
         explorerUrl: `https://tronscan.org/#/transaction/${tx.hash}`,
-        gasFee: tx.fee ? formatAmount(tx.fee, 6) : null,
       })));
     }
     const list = tD.token_transfers || tD.data;
@@ -809,7 +528,7 @@ export default function App() {
         const sym = info.symbol || info.tokenAbbr || 'TRC20';
         return {
           hash: tx.transaction_id, timestamp: tx.block_ts, from: tx.from_address, to: tx.to_address,
-          amount: formatAmount(tx.quant, dec), amountRaw: parseFloat(tx.quant) / Math.pow(10, dec),
+          amount: formatAmount(tx.quant, dec), rawAmount: tx.quant, decimals: dec,
           symbol: sym, type: 'TOKEN',
           status: tx.status === 1 || tx.status === undefined ? '成功' : '失败',
           explorerUrl: `https://tronscan.org/#/transaction/${tx.transaction_id}`,
@@ -819,13 +538,12 @@ export default function App() {
     return { txs, hasMore: nc === FETCH_LIMIT || tc === FETCH_LIMIT };
   };
 
-  // ============ 单笔交易查询 ============
   const fetchSingleTx = async (hash, txChain) => {
     if (txChain === 'ETH') {
       const k = ethApiKey ? `&apikey=${ethApiKey}` : '&apikey=YourApiKeyToken';
       const res = await fetch(`https://api.etherscan.io/api?module=proxy&action=eth_getTransactionByHash&txhash=${hash}${k}`).then(r => r.json());
       const tx = res.result;
-      if (!tx) throw new Error('未找到该交易');
+      if (!tx) throw new Error('未找到该交易,请检查交易哈希是否正确。');
       return {
         hash: tx.hash, from: tx.from, to: tx.to,
         amount: formatAmount(parseInt(tx.value, 16).toString(), 18),
@@ -834,7 +552,7 @@ export default function App() {
       };
     } else {
       const res = await tronFetch(`https://apilist.tronscanapi.com/api/transaction-info?hash=${hash}`).then(r => r.json());
-      if (!res || !res.hash) throw new Error('未找到该交易');
+      if (!res || !res.hash) throw new Error('未找到该交易,请检查交易哈希是否正确。');
       return {
         hash: res.hash, from: res.ownerAddress, to: res.toAddress,
         amount: res.contractData?.amount ? formatAmount(res.contractData.amount, 6) : '-',
@@ -844,7 +562,59 @@ export default function App() {
     }
   };
 
-  // ============ 主查询入口 ============
+  // 计算每笔交易后的余额
+  const calculatePostTransactionBalances = (txs, walletInfo) => {
+    if (!txs || txs.length === 0 || !walletInfo) return txs;
+    
+    const currentNative = walletInfo.native;
+    const currentUsdt = walletInfo.usdt;
+    const price = walletInfo.price || 0;
+    const currentTotalUsd = walletInfo.totalUsd || 0;
+    
+    // 按时间正序排序用于计算
+    const sorted = [...txs].sort((a, b) => a.timestamp - b.timestamp);
+    
+    let runningNative = currentNative;
+    let runningUsdt = currentUsdt;
+    let runningTotalUsd = currentTotalUsd;
+    
+    // 从最新到最老计算
+    const reversed = [...sorted].reverse();
+    
+    return reversed.map(tx => {
+      const isOut = tx.from?.toLowerCase() === currentQuery.address?.toLowerCase();
+      const isUsdtTx = tx.symbol === 'USDT' || tx.type === 'TOKEN';
+      const amountNum = parseFloat(tx.rawAmount || 0) / Math.pow(10, tx.decimals || 18);
+      
+      if (isOut) {
+        if (tx.type === 'NATIVE') {
+          runningNative += amountNum;
+          runningTotalUsd = runningNative * price + runningUsdt;
+        } else if (isUsdtTx) {
+          runningUsdt += amountNum;
+          runningTotalUsd = runningNative * price + runningUsdt;
+        }
+      } else {
+        if (tx.type === 'NATIVE') {
+          runningNative -= amountNum;
+          runningTotalUsd = runningNative * price + runningUsdt;
+        } else if (isUsdtTx) {
+          runningUsdt -= amountNum;
+          runningTotalUsd = runningNative * price + runningUsdt;
+        }
+      }
+      
+      return {
+        ...tx,
+        postBalance: {
+          native: Math.max(0, runningNative),
+          usdt: Math.max(0, runningUsdt),
+          totalUsd: Math.max(0, runningTotalUsd),
+        }
+      };
+    });
+  };
+
   const handleSearch = async (rawInput, isLoadMore = false) => {
     const raw = (rawInput ?? address).trim();
     if (!raw) return;
@@ -860,7 +630,7 @@ export default function App() {
         setLoading(true); setError(null);
         const resolved = await resolveEns(raw);
         setLoading(false);
-        if (!resolved) { setError(`无法解析 ENS 域名 "${raw}"`); return; }
+        if (!resolved) { setError(`无法解析 ENS 域名 "${raw}",请确认其已绑定地址。`); return; }
         return doSearch(resolved, 'ETH', false, raw);
       }
 
@@ -869,17 +639,16 @@ export default function App() {
         setActiveTab('search');
         setLoading(true); setError(null); setWalletInfo(null);
         setCurrentQuery({ address: '', chain: '' }); setAllTransactions([]);
-        setTxsWithBalances([]);
         try {
           const detail = await fetchSingleTx(raw, txChain);
           setSingleTx(detail);
-        } catch (e) { setError(e.message || '交易查询失败'); }
+        } catch (e) { setError(e.message || '交易查询失败。'); }
         finally { setLoading(false); }
         return;
       }
 
       if (info.type === 'UNKNOWN') {
-        setError('无法识别输入内容');
+        setError('无法识别输入内容,请输入有效的钱包地址、ENS 域名或交易哈希。');
         return;
       }
     }
@@ -887,7 +656,7 @@ export default function App() {
     let targetChain = chain;
     if (targetChain === 'AUTO') {
       targetChain = detectChain(raw);
-      if (!targetChain) { setError('无法自动识别网络'); return; }
+      if (!targetChain) { setError('无法自动识别网络,请确认地址格式正确。'); return; }
     }
     return doSearch(raw, targetChain, isLoadMore);
   };
@@ -896,14 +665,15 @@ export default function App() {
     if (!isLoadMore) {
       setLoading(true); setFetchingBalance(true); setWalletInfo(null);
       setError(null); setFilterType('ALL'); setCurrentPage(1); setApiPage(1);
-      setActiveTab('search'); setShowTaxReport(false);
+      setActiveTab('search');
     } else setLoadingMore(true);
 
     const targetApiPage = isLoadMore ? apiPage + 1 : 1;
     try {
       if (!isLoadMore) {
-        const info = await fetchWalletBalance(addr, targetChain);
-        setWalletInfo(info); setFetchingBalance(false);
+        fetchWalletBalance(addr, targetChain).then((info) => {
+          setWalletInfo(info); setFetchingBalance(false);
+        });
       }
       let result = { txs: [], hasMore: false };
       if (targetChain === 'ETH') result = await fetchEthData(addr, targetApiPage);
@@ -913,34 +683,10 @@ export default function App() {
       const unique = Array.from(new Map(merged.map(i => [i.hash + i.type, i])).values());
       unique.sort((a, b) => b.timestamp - a.timestamp);
       
-      // 为每笔交易添加当前地址标记
-      const txsWithAddress = unique.map(tx => ({ ...tx, currentAddress: addr.toLowerCase() }));
+      // 计算每笔交易后的余额
+      const withBalances = calculatePostTransactionBalances(unique, walletInfo);
       
-      setAllTransactions(txsWithAddress);
-      
-      // 计算交易后余额
-      if (walletInfo && !isLoadMore) {
-        const txsWithBalances = calculateBalancesAfterTx(
-          txsWithAddress, 
-          walletInfo.native, 
-          walletInfo.usdt, 
-          walletInfo.price
-        );
-        setTxsWithBalances(txsWithBalances);
-      } else if (isLoadMore && txsWithBalances.length > 0) {
-        // 追加加载时重新计算
-        const allTxs = [...txsWithAddress];
-        const txsWithBalances = calculateBalancesAfterTx(
-          allTxs, 
-          walletInfo?.native || 0, 
-          walletInfo?.usdt || 0, 
-          walletInfo?.price || 0
-        );
-        setTxsWithBalances(txsWithBalances);
-      } else {
-        setTxsWithBalances(txsWithAddress);
-      }
-      
+      setAllTransactions(withBalances);
       setHasMoreData(result.hasMore);
       setApiPage(targetApiPage);
       setCurrentQuery({ address: addr.toLowerCase(), chain: targetChain, ens: ensName || null });
@@ -951,12 +697,12 @@ export default function App() {
           let nh;
           if (exist) nh = [{ ...exist, lastQueried: Date.now(), ens: ensName || exist.ens || null }, ...prev.filter(i => i.address.toLowerCase() !== addr.toLowerCase())];
           else nh = [{ address: addr, chain: targetChain, remark: '', ens: ensName || null, lastQueried: Date.now() }, ...prev];
-          safeWriteHistory(nh);
+          safeWriteHistory(nh); 
           return nh;
         });
       }
     } catch (e) {
-      if (!isLoadMore) { setError(e.message || '查询失败'); setFetchingBalance(false); }
+      if (!isLoadMore) { setError(e.message || '查询失败,请检查地址或网络状态。'); setFetchingBalance(false); }
     } finally { setLoading(false); setLoadingMore(false); }
   };
 
@@ -981,10 +727,10 @@ export default function App() {
     localStorage.setItem('trx_api_key', trxKey || '');
   };
 
-  const updateRemark = (addr, rmk, ens = null) => {
+  const updateRemark = (addr, rmk) => {
     setHistory((h) => {
-      const nh = h.map(i => i.address === addr ? { ...i, remark: rmk, ens: ens || i.ens } : i);
-      safeWriteHistory(nh);
+      const nh = h.map(i => i.address === addr ? { ...i, remark: rmk } : i);
+      safeWriteHistory(nh); 
       return nh;
     });
   };
@@ -997,18 +743,8 @@ export default function App() {
     });
   };
 
-  const openEditRemark = (item) => {
-    setEditingRemark({ address: item.address, remark: item.remark || '', ens: item.ens || '' });
-    setShowRemarkModal(true);
-  };
-
-  const saveRemark = () => {
-    updateRemark(editingRemark.address, editingRemark.remark, editingRemark.ens);
-    setShowRemarkModal(false);
-  };
-
   const filteredTransactions = useMemo(() => {
-    return txsWithBalances.filter((tx) => {
+    return allTransactions.filter((tx) => {
       const isOut = tx.from?.toLowerCase() === currentQuery.address;
       const isIn = tx.to && tx.to.toLowerCase() === currentQuery.address;
       switch (filterType) {
@@ -1019,7 +755,13 @@ export default function App() {
         default: return true;
       }
     });
-  }, [txsWithBalances, currentQuery.address, filterType]);
+  }, [allTransactions, currentQuery.address, filterType]);
+
+  // 计算税务报表数据
+  const taxReportData = useMemo(() => {
+    if (!showTaxReport || !currentQuery.address || filteredTransactions.length === 0) return null;
+    return filteredTransactions;
+  }, [showTaxReport, filteredTransactions, currentQuery.address]);
 
   const totalPages = Math.ceil(filteredTransactions.length / PAGE_SIZE) || 1;
   const paginated = filteredTransactions.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
@@ -1041,54 +783,14 @@ export default function App() {
     [history]
   );
 
-  // ============ 税务报表相关 ============
-  const getTaxPeriod = () => {
-    const now = new Date();
-    let start, end;
-    
-    switch (taxPeriodType) {
-      case 'month':
-        start = new Date(now.getFullYear(), now.getMonth(), 1);
-        end = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999);
-        break;
-      case 'quarter':
-        const quarter = Math.floor(now.getMonth() / 3);
-        start = new Date(now.getFullYear(), quarter * 3, 1);
-        end = new Date(now.getFullYear(), quarter * 3 + 3, 0, 23, 59, 59, 999);
-        break;
-      case 'year':
-        start = new Date(now.getFullYear(), 0, 1);
-        end = new Date(now.getFullYear(), 11, 31, 23, 59, 59, 999);
-        break;
-      case 'custom':
-        start = taxCustomStart ? new Date(taxCustomStart) : new Date(now.getFullYear(), 0, 1);
-        end = taxCustomEnd ? new Date(taxCustomEnd + 'T23:59:59.999Z') : now;
-        break;
-      default:
-        start = new Date(now.getFullYear(), now.getMonth(), 1);
-        end = now;
-    }
-    
-    return { start: start.getTime(), end: end.getTime() };
-  };
-
-  const generateTaxReport = () => {
-    const period = getTaxPeriod();
-    const report = calculateTaxReport(allTransactions, period.start, period.end);
-    setTaxReportData(report);
-    setShowTaxReport(true);
-  };
-
   const mainContentProps = {
     chain, setChain, address, setAddress, handleSearch, loading,
     error, singleTx, currentQuery, fetchingBalance, walletInfo, allocation,
     filterType, setFilterType, paginated, remarkMap, jumpToAddress,
     currentPage, setCurrentPage, totalPages, filteredTransactions,
     hasMoreData, loadingMore, isMobile, setShowScanner,
-    // 新增
-    openEditRemark, showTaxReport, setShowTaxReport, taxReportData, taxPeriodType, 
-    setTaxPeriodType, taxCustomStart, setTaxCustomStart, taxCustomEnd, setTaxCustomEnd,
-    generateTaxReport, txsWithBalances, walletInfo,
+    showTaxReport, setShowTaxReport, taxReportData,
+    history, onUpdateRemark: updateRemark, onRemove: removeHistory,
   };
 
   const settingsProps = {
@@ -1097,17 +799,15 @@ export default function App() {
     onSaveKey: saveApiKey, showKey, setShowKey,
   };
 
-  // ============ 渲染 ============
   return (
     <div className="min-h-screen bg-[#F7F7FB] dark:bg-[#0B0E14] text-slate-800 dark:text-slate-100 transition-colors"
       style={{ paddingTop: 'env(safe-area-inset-top)', paddingBottom: 'env(safe-area-inset-bottom)' }}>
       <GlobalStyles />
 
-      {/* ===== 桌面布局 ===== */}
       <div className="hidden lg:flex h-screen overflow-hidden">
         <Sidebar collapsed={sidebarCollapsed} onToggle={() => setSidebarCollapsed(v => !v)}
           activeTab={activeTab} setActiveTab={setActiveTab} history={sortedHistory}
-          onJump={jumpToAddress} onUpdateRemark={openEditRemark} onRemove={removeHistory} />
+          onJump={jumpToAddress} onUpdateRemark={updateRemark} onRemove={removeHistory} />
 
         <div className="flex-1 flex flex-col overflow-hidden">
           <TopBar user={user} onLogin={handleGoogleLogin} onLogout={handleLogout}
@@ -1120,7 +820,6 @@ export default function App() {
         </div>
       </div>
 
-      {/* ===== 移动布局 ===== */}
       <div className="lg:hidden flex flex-col min-h-screen pb-20">
         <MobileHeader user={user} onLogin={handleGoogleLogin}
           theme={theme} setTheme={setTheme} onAvatar={() => setActiveTab('settings')} />
@@ -1129,7 +828,7 @@ export default function App() {
             ? <SettingsPanel {...settingsProps} />
             : activeTab === 'history'
             ? <MobileHistoryList history={sortedHistory} onJump={jumpToAddress}
-                onUpdateRemark={openEditRemark} onRemove={removeHistory} />
+                onUpdateRemark={updateRemark} onRemove={removeHistory} />
             : <MainContent {...mainContentProps} isMobileLayout={true} />}
         </div>
         <MobileTabBar activeTab={activeTab} setActiveTab={setActiveTab} />
@@ -1147,56 +846,10 @@ export default function App() {
       )}
 
       {showScanner && <QrScannerModal onClose={() => setShowScanner(false)} onScan={handleScan} setError={setError} />}
-      
-      {/* 备注编辑弹窗 */}
-      {showRemarkModal && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[100] p-4">
-          <div className="bg-white dark:bg-[#13111C] rounded-2xl p-6 w-full max-w-sm">
-            <h3 className="font-bold text-lg mb-4">编辑备注</h3>
-            <div className="space-y-3">
-              <div>
-                <label className="block text-xs text-slate-400 mb-1">地址</label>
-                <div className="font-mono text-sm text-slate-500">{shortenAddress(editingRemark.address)}</div>
-              </div>
-              <div>
-                <label className="block text-sm font-medium mb-1">备注名称</label>
-                <input
-                  type="text"
-                  value={editingRemark.remark}
-                  onChange={(e) => setEditingRemark(prev => ({ ...prev, remark: e.target.value }))}
-                  placeholder="输入备注名称，如：我的钱包、项目方地址"
-                  className="w-full px-3 py-2.5 rounded-xl bg-slate-100 dark:bg-white/5 text-sm focus:outline-none focus:ring-2 focus:ring-[#AB9FF2]/40"
-                />
-              </div>
-              <div>
-                <label className="block text-xs text-slate-400 mb-1">ENS 域名</label>
-                <input
-                  type="text"
-                  value={editingRemark.ens}
-                  onChange={(e) => setEditingRemark(prev => ({ ...prev, ens: e.target.value }))}
-                  placeholder="可选，绑定ENS域名"
-                  className="w-full px-3 py-2.5 rounded-xl bg-slate-100 dark:bg-white/5 text-sm focus:outline-none focus:ring-2 focus:ring-[#AB9FF2]/40"
-                />
-              </div>
-            </div>
-            <div className="flex gap-3 mt-5">
-              <button onClick={() => setShowRemarkModal(false)}
-                className="flex-1 px-4 py-2.5 border border-slate-200 dark:border-white/10 rounded-xl text-sm font-medium">
-                取消
-              </button>
-              <button onClick={saveRemark}
-                className="flex-1 px-4 py-2.5 bg-gradient-to-r from-[#AB9FF2] to-[#5C4FE0] text-white rounded-xl text-sm font-semibold">
-                保存
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
 
-// ============ 全局样式 ============
 function GlobalStyles() {
   return (
     <style>{`
@@ -1210,13 +863,10 @@ function GlobalStyles() {
       .page-enter { animation: fadeUp 0.25s ease-out; }
       .hide-scrollbar::-webkit-scrollbar { display: none; }
       .hide-scrollbar { scrollbar-width: none; }
-      /* 左滑样式 */
-      .swipe-content { touch-action: pan-y; }
     `}</style>
   );
 }
 
-// ============ 桌面侧栏 ============
 function Sidebar({ collapsed, onToggle, activeTab, setActiveTab, history, onJump, onUpdateRemark, onRemove }) {
   const navItems = [
     { id: 'search', label: '查询', icon: Search },
@@ -1256,19 +906,8 @@ function Sidebar({ collapsed, onToggle, activeTab, setActiveTab, history, onJump
             {history.length === 0 ? (
               <p className="text-xs text-slate-400 px-3 py-4 text-center">暂无历史</p>
             ) : history.map(item => (
-              <SwipeAction
-                key={item.address}
-                onEdit={() => onUpdateRemark(item)}
-                onDelete={() => onRemove(item.address)}
-                editLabel="编辑"
-                deleteLabel="删除"
-              >
-                <HistoryCardContent 
-                  item={item} 
-                  onSelect={() => onJump(item.address)}
-                  onEdit={() => onUpdateRemark(item)}
-                />
-              </SwipeAction>
+              <HistoryCard key={item.address} item={item} onSelect={() => onJump(item.address)}
+                onUpdateRemark={onUpdateRemark} onRemove={onRemove} compact />
             ))}
           </div>
         </div>
@@ -1282,31 +921,6 @@ function Sidebar({ collapsed, onToggle, activeTab, setActiveTab, history, onJump
   );
 }
 
-// ============ 历史卡片内容（无编辑删除按钮）============
-function HistoryCardContent({ item, onSelect, onEdit }) {
-  return (
-    <div onClick={onSelect}
-      className="bg-slate-50 dark:bg-white/5 hover:bg-[#AB9FF2]/10 border border-transparent hover:border-[#AB9FF2]/30 rounded-xl p-3 cursor-pointer transition-all">
-      <div className="flex items-center gap-2 mb-2">
-        <span className={`text-[9px] px-1.5 py-0.5 rounded font-bold ${item.chain === 'ETH' ? 'bg-blue-100 text-blue-700' : 'bg-red-100 text-red-700'}`}>{item.chain}</span>
-        <span className="font-mono text-xs font-medium truncate">{item.ens || shortenAddress(item.address)}</span>
-      </div>
-      <div className="flex items-center justify-between gap-2">
-        <span className={`text-xs truncate ${item.remark ? 'text-slate-600 dark:text-slate-300 font-medium' : 'text-slate-400'}`}>
-          {item.remark || '点击查看'}
-        </span>
-        {item.remark && (
-          <button onClick={(e) => { e.stopPropagation(); onEdit(); }}
-            className="p-1 rounded text-slate-400 hover:text-[#AB9FF2] flex-shrink-0">
-            <Edit2 className="w-3.5 h-3.5" />
-          </button>
-        )}
-      </div>
-    </div>
-  );
-}
-
-// ============ 桌面顶栏 ============
 function TopBar({ user, onLogin, onLogout, theme, setTheme, onOpenSettings }) {
   return (
     <header className="h-16 flex-shrink-0 px-8 flex items-center justify-between border-b border-slate-200 dark:border-white/5 bg-white/70 dark:bg-[#0B0E14]/70 backdrop-blur-xl">
@@ -1336,7 +950,6 @@ function TopBar({ user, onLogin, onLogout, theme, setTheme, onOpenSettings }) {
   );
 }
 
-// ============ 移动端顶栏 ============
 function MobileHeader({ user, onLogin, theme, setTheme, onAvatar }) {
   return (
     <header className="px-5 pt-5 pb-2 flex items-center justify-between sticky top-0 z-30 bg-[#F7F7FB]/80 dark:bg-[#0B0E14]/80 backdrop-blur-xl">
@@ -1358,7 +971,6 @@ function MobileHeader({ user, onLogin, theme, setTheme, onAvatar }) {
   );
 }
 
-// ============ 主题切换按钮 ============
 function ThemeToggleBtn({ theme, setTheme }) {
   const next = theme === 'dark' ? 'light' : theme === 'light' ? 'system' : 'dark';
   const Icon = theme === 'dark' ? Moon : theme === 'light' ? Sun : Monitor;
@@ -1370,7 +982,6 @@ function ThemeToggleBtn({ theme, setTheme }) {
   );
 }
 
-// ============ 移动端底部 Tab ============
 function MobileTabBar({ activeTab, setActiveTab }) {
   const tabs = [
     { id: 'search', label: '查询', icon: Search },
@@ -1395,17 +1006,31 @@ function MobileTabBar({ activeTab, setActiveTab }) {
   );
 }
 
-// ============ 主内容 ============
 function MainContent(props) {
   const {
     chain, setChain, address, setAddress, handleSearch, loading, error, singleTx,
     currentQuery, fetchingBalance, walletInfo, allocation, filterType, setFilterType,
     paginated, remarkMap, jumpToAddress, currentPage, setCurrentPage, totalPages,
     filteredTransactions, hasMoreData, loadingMore, isMobile, setShowScanner, isMobileLayout,
-    openEditRemark, showTaxReport, setShowTaxReport, taxReportData, taxPeriodType,
-    setTaxPeriodType, taxCustomStart, setTaxCustomStart, taxCustomEnd, setTaxCustomEnd,
-    generateTaxReport, txsWithBalances,
+    showTaxReport, setShowTaxReport, taxReportData,
+    history, onUpdateRemark, onRemove,
   } = props;
+
+  const currentRemark = currentQuery.address ? remarkMap[currentQuery.address] || '' : '';
+  const [editingRemark, setEditingRemark] = useState(false);
+  const [remarkVal, setRemarkVal] = useState('');
+
+  const handleSaveRemark = () => {
+    if (currentQuery.address) {
+      onUpdateRemark(currentQuery.address, remarkVal);
+      setEditingRemark(false);
+    }
+  };
+
+  const handleEditRemark = () => {
+    setRemarkVal(currentRemark);
+    setEditingRemark(true);
+  };
 
   return (
     <div className="max-w-5xl mx-auto space-y-5">
@@ -1425,7 +1050,7 @@ function MainContent(props) {
               placeholder="钱包地址、ENS 域名 或交易哈希"
               className="w-full pl-10 pr-12 py-3 rounded-xl bg-slate-100 dark:bg-white/5 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-[#AB9FF2]/40 placeholder:font-sans placeholder:text-slate-400" />
             {isMobile && (
-              <button onClick={() => { if (!window.Html5Qrcode) { alert('扫码组件加载中'); return; } setShowScanner(true); }}
+              <button onClick={() => { if (!window.Html5Qrcode) { alert('扫码组件加载中,请稍候'); return; } setShowScanner(true); }}
                 className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-[#AB9FF2]">
                 <Scan className="w-5 h-5" />
               </button>
@@ -1447,56 +1072,6 @@ function MainContent(props) {
       )}
 
       {singleTx && <SingleTxCard tx={singleTx} />}
-
-      {/* 顶部操作栏：编辑备注、删除、历史按钮 */}
-      {currentQuery.address && !error && !singleTx && (
-        <div className="bg-white dark:bg-[#13111C] rounded-2xl border border-slate-200 dark:border-white/5 p-3 flex items-center justify-between">
-          <div className="flex items-center gap-2 text-sm">
-            <span className={`w-2 h-2 rounded-full ${currentQuery.chain === 'ETH' ? 'bg-blue-500' : 'bg-red-500'}`} />
-            {currentQuery.ens ? <span className="font-semibold text-[#AB9FF2]">{currentQuery.ens}</span> : null}
-            <span className="font-mono text-slate-500">{shortenAddress(currentQuery.address)}</span>
-            {remarkMap[currentQuery.address] && (
-              <span className="px-2 py-0.5 bg-amber-100 dark:bg-amber-500/20 text-amber-600 dark:text-amber-400 rounded text-xs font-medium">
-                {remarkMap[currentQuery.address]}
-              </span>
-            )}
-          </div>
-          <div className="flex items-center gap-2">
-            <button
-              onClick={() => openEditRemark({ address: currentQuery.address, remark: remarkMap[currentQuery.address] || '', ens: currentQuery.ens })}
-              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-500 hover:text-[#AB9FF2] hover:bg-[#AB9FF2]/10 rounded-lg transition-colors"
-            >
-              <Edit2 className="w-3.5 h-3.5" />
-              编辑备注
-            </button>
-            <button
-              onClick={() => generateTaxReport()}
-              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-500 hover:text-emerald-500 hover:bg-emerald-500/10 rounded-lg transition-colors"
-            >
-              <FileText className="w-3.5 h-3.5" />
-              税务报表
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* 税务报表弹窗 */}
-      {showTaxReport && taxReportData && (
-        <TaxReportModal
-          report={taxReportData}
-          address={currentQuery.address}
-          chain={currentQuery.chain}
-          periodType={taxPeriodType}
-          setPeriodType={setTaxPeriodType}
-          customStart={taxCustomStart}
-          setCustomStart={setTaxCustomStart}
-          customEnd={taxCustomEnd}
-          setCustomEnd={setTaxCustomEnd}
-          onClose={() => setShowTaxReport(false)}
-          onGenerate={generateTaxReport}
-          price={walletInfo?.price || 0}
-        />
-      )}
 
       {currentQuery.address && !error && !singleTx && (
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
@@ -1527,6 +1102,71 @@ function MainContent(props) {
         </div>
       )}
 
+      {/* 操作按钮和备注区域 - 仅在查询到地址时显示 */}
+      {currentQuery.address && !error && !singleTx && (
+        <div className="bg-white dark:bg-[#13111C] rounded-2xl border border-slate-200 dark:border-white/5 p-4">
+          <div className="flex flex-col sm:flex-row items-start sm:items-center gap-4">
+            {/* 备注显示/编辑 */}
+            <div className="flex-1 min-w-0">
+              {editingRemark ? (
+                <div className="flex items-center gap-2">
+                  <input
+                    autoFocus
+                    value={remarkVal}
+                    onChange={e => setRemarkVal(e.target.value)}
+                    onKeyDown={e => e.key === 'Enter' && handleSaveRemark()}
+                    placeholder="输入备注/标签..."
+                    className="flex-1 px-3 py-2 rounded-lg bg-slate-100 dark:bg-white/5 text-sm border border-[#AB9FF2]/40 focus:outline-none focus:ring-2 focus:ring-[#AB9FF2]/40"
+                  />
+                  <button onClick={handleSaveRemark} className="px-3 py-2 bg-emerald-500 text-white rounded-lg text-sm font-medium flex items-center gap-1 hover:bg-emerald-600">
+                    <Check className="w-4 h-4" /> 保存
+                  </button>
+                  <button onClick={() => setEditingRemark(false)} className="px-3 py-2 bg-slate-200 dark:bg-white/10 rounded-lg text-sm font-medium hover:bg-slate-300 dark:hover:bg-white/20">
+                    取消
+                  </button>
+                </div>
+              ) : (
+                <div className="flex items-center gap-2">
+                  <div className={`text-sm ${currentRemark ? 'text-slate-700 dark:text-slate-200' : 'text-slate-400'}`}>
+                    {currentRemark ? (
+                      <span className="flex items-center gap-2">
+                        <span className="bg-amber-100 dark:bg-amber-500/20 text-amber-700 dark:text-amber-300 px-2 py-0.5 rounded text-xs font-medium">备注</span>
+                        {currentRemark}
+                      </span>
+                    ) : (
+                      <span className="text-slate-400">点击编辑按钮添加备注</span>
+                    )}
+                  </div>
+                  <button onClick={handleEditRemark} className="p-2 text-slate-400 hover:text-[#AB9FF2] hover:bg-[#AB9FF2]/10 rounded-lg transition-colors" title="编辑备注">
+                    <Edit2 className="w-4 h-4" />
+                  </button>
+                </div>
+              )}
+            </div>
+            
+            {/* 操作按钮 */}
+            <div className="flex items-center gap-2 flex-shrink-0">
+              <button onClick={handleEditRemark} className="flex items-center gap-2 px-4 py-2.5 bg-blue-500 hover:bg-blue-600 text-white rounded-xl text-sm font-medium shadow-lg shadow-blue-500/25 transition-all">
+                <Edit2 className="w-4 h-4" /> 编辑备注
+              </button>
+              <button onClick={() => setShowTaxReport(true)} className="flex items-center gap-2 px-4 py-2.5 bg-gradient-to-r from-[#AB9FF2] to-[#5C4FE0] hover:shadow-[#AB9FF2]/40 text-white rounded-xl text-sm font-medium shadow-lg shadow-[#AB9FF2]/25 transition-all">
+                <Calculator className="w-4 h-4" /> 税务报表
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 税务报表弹窗 */}
+      {showTaxReport && currentQuery.address && (
+        <TaxReportModal
+          transactions={filteredTransactions}
+          walletInfo={walletInfo}
+          currentAddress={currentQuery.address}
+          onClose={() => setShowTaxReport(false)}
+        />
+      )}
+
       {currentQuery.address && !error && !singleTx && (
         <div className="bg-white dark:bg-[#13111C] rounded-2xl border border-slate-200 dark:border-white/5 overflow-hidden">
           <div className="p-4 border-b border-slate-100 dark:border-white/5 flex items-center justify-between gap-3 flex-wrap">
@@ -1541,8 +1181,10 @@ function MainContent(props) {
                 );
               })}
             </div>
-            <div className="text-xs text-slate-400">
-              共 {filteredTransactions.length} 条记录
+            <div className="text-xs text-slate-400 flex items-center gap-1.5">
+              <span className={`w-2 h-2 rounded-full ${currentQuery.chain === 'ETH' ? 'bg-blue-500' : 'bg-red-500'}`} />
+              {currentQuery.ens ? <span className="font-semibold text-[#AB9FF2]">{currentQuery.ens}</span> : null}
+              <span className="font-mono">{shortenAddress(currentQuery.address)}</span>
             </div>
           </div>
 
@@ -1551,7 +1193,7 @@ function MainContent(props) {
               : paginated.length === 0 ? <div className="py-16 text-center text-slate-400 text-sm">该分类下未找到交易记录</div>
               : paginated.map((tx, i) => (
                 <TxRow key={`${tx.hash}-${i}`} tx={tx} currentAddress={currentQuery.address}
-                  remarkMap={remarkMap} onAddressClick={jumpToAddress} walletInfo={walletInfo} />
+                  remarkMap={remarkMap} onAddressClick={jumpToAddress} chain={currentQuery.chain} />
               ))}
           </div>
 
@@ -1591,136 +1233,261 @@ function MainContent(props) {
 }
 
 // ============ 税务报表弹窗 ============
-function TaxReportModal({ report, address, chain, periodType, setPeriodType, customStart, setCustomStart, customEnd, setCustomEnd, onClose, onGenerate, price }) {
-  const { summary, transactions } = report;
-  
+function TaxReportModal({ transactions, walletInfo, currentAddress, onClose }) {
+  const [reportType, setReportType] = useState('month'); // month, quarter, year
+  const [selectedYear, setSelectedYear] = useState(new Date().getFullYear());
+  const [selectedMonth, setSelectedMonth] = useState(new Date().getMonth() + 1);
+  const [selectedQuarter, setSelectedQuarter] = useState(Math.floor(new Date().getMonth() / 3) + 1);
+  const [showExport, setShowExport] = useState(false);
+
+  const years = Array.from({ length: 5 }, (_, i) => new Date().getFullYear() - i);
+  const months = Array.from({ length: 12 }, (_, i) => i + 1);
+  const quarters = [1, 2, 3, 4];
+
+  const getDateRange = () => {
+    const year = selectedYear;
+    if (reportType === 'month') {
+      return {
+        start: new Date(year, selectedMonth - 1, 1),
+        end: new Date(year, selectedMonth, 0, 23, 59, 59),
+        label: `${year}年${selectedMonth}月`,
+      };
+    } else if (reportType === 'quarter') {
+      const startMonth = (selectedQuarter - 1) * 3;
+      return {
+        start: new Date(year, startMonth, 1),
+        end: new Date(year, startMonth + 3, 0, 23, 59, 59),
+        label: `${year}年第${selectedQuarter}季度`,
+      };
+    } else {
+      return {
+        start: new Date(year, 0, 1),
+        end: new Date(year, 11, 31, 23, 59, 59),
+        label: `${year}年`,
+      };
+    }
+  };
+
+  const { start, end, label } = getDateRange();
+
+  const filteredTxs = useMemo(() => {
+    return transactions.filter(tx => {
+      const ts = tx.timestamp;
+      return ts >= start.getTime() && ts <= end.getTime();
+    });
+  }, [transactions, start, end]);
+
+  const reportData = useMemo(() => {
+    let totalInflow = 0; // 转入总额(USD)
+    let totalOutflow = 0; // 转出总额(USD)
+    let trxInflow = 0;
+    let trxOutflow = 0;
+    let usdtInflow = 0;
+    let usdtOutflow = 0;
+    let txCount = 0;
+
+    filteredTxs.forEach(tx => {
+      const isOut = tx.from?.toLowerCase() === currentAddress.toLowerCase();
+      const isIn = tx.to && tx.to.toLowerCase() === currentAddress.toLowerCase();
+      const amount = parseFloat(tx.rawAmount || 0) / Math.pow(10, tx.decimals || 18);
+      
+      txCount++;
+
+      if (tx.symbol === 'TRX' || tx.type === 'NATIVE') {
+        const usdValue = amount * (walletInfo?.price || 0);
+        if (isIn) {
+          totalInflow += usdValue;
+          trxInflow += amount;
+        } else if (isOut) {
+          totalOutflow += usdValue;
+          trxOutflow += amount;
+        }
+      } else if (tx.symbol === 'USDT') {
+        if (isIn) {
+          totalInflow += amount;
+          usdtInflow += amount;
+        } else if (isOut) {
+          totalOutflow += amount;
+          usdtOutflow += amount;
+        }
+      }
+    });
+
+    return {
+      txCount,
+      totalInflow,
+      totalOutflow,
+      netFlow: totalInflow - totalOutflow,
+      trxInflow,
+      trxOutflow,
+      usdtInflow,
+      usdtOutflow,
+    };
+  }, [filteredTxs, currentAddress, walletInfo]);
+
+  const handleExportCSV = () => {
+    const rows = [
+      ['税务报表 - ' + label],
+      ['钱包地址', currentAddress],
+      ['生成时间', new Date().toLocaleString('zh-CN')],
+      [''],
+      ['时间区间', `${start.toLocaleDateString('zh-CN')} ~ ${end.toLocaleDateString('zh-CN')}`],
+      [''],
+      ['=== 交易统计 ==='],
+      ['交易总数', reportData.txCount],
+      [''],
+      ['=== 资产流动 ==='],
+      ['TRX 转入', reportData.trxInflow.toFixed(6)],
+      ['TRX 转出', reportData.trxOutflow.toFixed(6)],
+      ['USDT 转入', reportData.usdtInflow.toFixed(2)],
+      ['USDT 转出', reportData.usdtOutflow.toFixed(2)],
+      [''],
+      ['=== 估值统计 (USD) ==='],
+      ['总转入', reportData.totalInflow.toFixed(2)],
+      ['总转出', reportData.totalOutflow.toFixed(2)],
+      ['净流动', reportData.netFlow.toFixed(2)],
+      [''],
+      ['=== 交易明细 ==='],
+      ['时间', '类型', '方向', '代币', '金额', '交易哈希'],
+    ];
+
+    filteredTxs.forEach(tx => {
+      const isOut = tx.from?.toLowerCase() === currentAddress.toLowerCase();
+      const isIn = tx.to && tx.to.toLowerCase() === currentAddress.toLowerCase();
+      rows.push([
+        formatDate(tx.timestamp),
+        tx.type === 'NATIVE' ? '主网币' : '代币',
+        isIn ? '转入' : '转出',
+        tx.symbol,
+        tx.amount,
+        tx.hash,
+      ]);
+    });
+
+    const csvContent = rows.map(row => row.map(cell => `"${cell}"`).join(',')).join('\n');
+    const blob = new Blob(['\ufeff' + csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `tax_report_${label.replace(/\s/g, '_')}.csv`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
   return (
-    <div className="bg-white dark:bg-[#13111C] rounded-2xl border border-slate-200 dark:border-white/5 overflow-hidden">
-      <div className="p-4 border-b border-slate-100 dark:border-white/5 flex items-center justify-between">
-        <h3 className="font-bold flex items-center gap-2">
-          <FileText className="w-5 h-5 text-emerald-500" />
-          税务报表
-        </h3>
-        <div className="flex items-center gap-2">
-          <button
-            onClick={() => exportTaxReportCSV(report, address, chain)}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-emerald-500 text-white rounded-lg hover:bg-emerald-600 transition-colors"
-          >
-            <Download className="w-3.5 h-3.5" />
-            导出CSV
-          </button>
-          <button onClick={onClose} className="p-1.5 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300">
+    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-[90] p-4">
+      <div className="bg-white dark:bg-[#1A1726] rounded-2xl shadow-2xl w-full max-w-2xl max-h-[90vh] overflow-hidden flex flex-col">
+        <div className="p-5 border-b border-slate-200 dark:border-white/10 flex items-center justify-between">
+          <h3 className="font-bold text-lg flex items-center gap-2">
+            <Calculator className="w-5 h-5 text-[#AB9FF2]" />
+            税务报表
+          </h3>
+          <button onClick={onClose} className="p-2 text-slate-400 hover:text-slate-600 dark:hover:text-white rounded-lg hover:bg-slate-100 dark:hover:bg-white/10">
             <X className="w-5 h-5" />
           </button>
         </div>
-      </div>
-      
-      <div className="p-4 space-y-4">
-        {/* 时间区间选择 */}
-        <div className="flex flex-wrap gap-2">
-          {[
-            { id: 'month', label: '本月' },
-            { id: 'quarter', label: '本季度' },
-            { id: 'year', label: '本年' },
-            { id: 'custom', label: '自定义' },
-          ].map(p => (
-            <button
-              key={p.id}
-              onClick={() => setPeriodType(p.id)}
-              className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
-                periodType === p.id 
-                  ? 'bg-emerald-500 text-white' 
-                  : 'bg-slate-100 dark:bg-white/5 text-slate-500 hover:bg-slate-200 dark:hover:bg-white/10'
-              }`}
-            >
-              {p.label}
-            </button>
-          ))}
+
+        <div className="p-5 border-b border-slate-200 dark:border-white/10 space-y-4">
+          <div className="flex gap-2">
+            {[
+              { id: 'month', label: '月报' },
+              { id: 'quarter', label: '季报' },
+              { id: 'year', label: '年报' },
+            ].map(t => (
+              <button key={t.id} onClick={() => setReportType(t.id)}
+                className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+                  reportType === t.id ? 'bg-[#AB9FF2] text-white' : 'bg-slate-100 dark:bg-white/5 text-slate-600 dark:text-slate-300'
+                }`}>
+                {t.label}
+              </button>
+            ))}
+          </div>
+
+          <div className="flex items-center gap-3 flex-wrap">
+            <select value={selectedYear} onChange={e => setSelectedYear(parseInt(e.target.value))}
+              className="px-3 py-2 rounded-lg bg-slate-100 dark:bg-white/5 text-sm">
+              {years.map(y => <option key={y} value={y}>{y}年</option>)}
+            </select>
+
+            {reportType === 'month' && (
+              <select value={selectedMonth} onChange={e => setSelectedMonth(parseInt(e.target.value))}
+                className="px-3 py-2 rounded-lg bg-slate-100 dark:bg-white/5 text-sm">
+                {months.map(m => <option key={m} value={m}>{m}月</option>)}
+              </select>
+            )}
+
+            {reportType === 'quarter' && (
+              <select value={selectedQuarter} onChange={e => setSelectedQuarter(parseInt(e.target.value))}
+                className="px-3 py-2 rounded-lg bg-slate-100 dark:bg-white/5 text-sm">
+                {quarters.map(q => <option key={q} value={q}>Q{q}</option>)}
+              </select>
+            )}
+          </div>
         </div>
-        
-        {periodType === 'custom' && (
-          <div className="flex gap-3 items-center">
-            <input
-              type="date"
-              value={customStart}
-              onChange={(e) => setCustomStart(e.target.value)}
-              className="flex-1 px-3 py-2 rounded-lg bg-slate-100 dark:bg-white/5 text-sm"
-            />
-            <span className="text-slate-400">至</span>
-            <input
-              type="date"
-              value={customEnd}
-              onChange={(e) => setCustomEnd(e.target.value)}
-              className="flex-1 px-3 py-2 rounded-lg bg-slate-100 dark:bg-white/5 text-sm"
-            />
-            <button
-              onClick={onGenerate}
-              className="px-4 py-2 bg-emerald-500 text-white rounded-lg text-sm font-medium hover:bg-emerald-600"
-            >
-              生成
-            </button>
-          </div>
-        )}
-        
-        {/* 汇总数据 */}
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-          <div className="bg-slate-50 dark:bg-white/5 rounded-xl p-3">
-            <div className="text-xs text-slate-400 mb-1">交易笔数</div>
-            <div className="text-lg font-bold">{summary.transactionCount}</div>
-          </div>
-          <div className="bg-emerald-50 dark:bg-emerald-500/10 rounded-xl p-3">
-            <div className="text-xs text-emerald-600 dark:text-emerald-400 mb-1">买入（{chain}）</div>
-            <div className="text-lg font-bold text-emerald-600">{summary.totalBuyNative.toLocaleString(undefined, { maximumFractionDigits: 4 })}</div>
-          </div>
-          <div className="bg-rose-50 dark:bg-rose-500/10 rounded-xl p-3">
-            <div className="text-xs text-rose-600 dark:text-rose-400 mb-1">卖出（{chain}）</div>
-            <div className="text-lg font-bold text-rose-600">{summary.totalSellNative.toLocaleString(undefined, { maximumFractionDigits: 4 })}</div>
-          </div>
-          <div className="bg-amber-50 dark:bg-amber-500/10 rounded-xl p-3">
-            <div className="text-xs text-amber-600 dark:text-amber-400 mb-1">净差额</div>
-            <div className={`text-lg font-bold ${summary.netNative >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
-              {summary.netNative >= 0 ? '+' : ''}{summary.netNative.toLocaleString(undefined, { maximumFractionDigits: 4 })}
+
+        <div className="flex-1 overflow-y-auto p-5 space-y-4">
+          <div className="grid grid-cols-2 gap-3">
+            <div className="bg-gradient-to-br from-emerald-500 to-emerald-600 rounded-xl p-4 text-white">
+              <div className="text-white/70 text-xs mb-1">总转入 (USD)</div>
+              <div className="text-xl font-bold">${reportData.totalInflow.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+            </div>
+            <div className="bg-gradient-to-br from-rose-500 to-rose-600 rounded-xl p-4 text-white">
+              <div className="text-white/70 text-xs mb-1">总转出 (USD)</div>
+              <div className="text-xl font-bold">${reportData.totalOutflow.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
             </div>
           </div>
+
+          <div className="bg-gradient-to-br from-[#6E5FE0] to-[#4B3FC0] rounded-xl p-4 text-white">
+            <div className="text-white/70 text-xs mb-1">净流动 (USD)</div>
+            <div className="text-2xl font-bold ${reportData.netFlow >= 0 ? '' : 'text-rose-200'}">
+              ${reportData.netFlow.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+            </div>
+          </div>
+
+          <div className="bg-slate-50 dark:bg-white/5 rounded-xl p-4 space-y-3">
+            <h4 className="font-semibold text-sm">详细统计</h4>
+            <div className="grid grid-cols-2 gap-4 text-sm">
+              <div>
+                <div className="text-slate-400 text-xs">交易总数</div>
+                <div className="font-semibold">{reportData.txCount}</div>
+              </div>
+              <div>
+                <div className="text-slate-400 text-xs">TRX 转入</div>
+                <div className="font-semibold">{reportData.trxInflow.toFixed(2)}</div>
+              </div>
+              <div>
+                <div className="text-slate-400 text-xs">TRX 转出</div>
+                <div className="font-semibold">{reportData.trxOutflow.toFixed(2)}</div>
+              </div>
+              <div>
+                <div className="text-slate-400 text-xs">USDT 转入</div>
+                <div className="font-semibold">{reportData.usdtInflow.toFixed(2)}</div>
+              </div>
+              <div>
+                <div className="text-slate-400 text-xs">USDT 转出</div>
+                <div className="font-semibold">{reportData.usdtOutflow.toFixed(2)}</div>
+              </div>
+            </div>
+          </div>
+
+          <div className="text-center text-xs text-slate-400">
+            时间区间: {start.toLocaleDateString('zh-CN')} ~ {end.toLocaleDateString('zh-CN')}
+          </div>
         </div>
-        
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-          <div className="bg-blue-50 dark:bg-blue-500/10 rounded-xl p-3">
-            <div className="text-xs text-blue-600 dark:text-blue-400 mb-1">买入USDT</div>
-            <div className="text-lg font-bold text-blue-600">{summary.totalBuyUsdt.toLocaleString(undefined, { maximumFractionDigits: 2 })}</div>
-          </div>
-          <div className="bg-purple-50 dark:bg-purple-500/10 rounded-xl p-3">
-            <div className="text-xs text-purple-600 dark:text-purple-400 mb-1">卖出USDT</div>
-            <div className="text-lg font-bold text-purple-600">{summary.totalSellUsdt.toLocaleString(undefined, { maximumFractionDigits: 2 })}</div>
-          </div>
-          <div className="bg-cyan-50 dark:bg-cyan-500/10 rounded-xl p-3">
-            <div className="text-xs text-cyan-600 dark:text-cyan-400 mb-1">转入代币</div>
-            <div className="text-lg font-bold text-cyan-600">{summary.totalTransferIn.toLocaleString(undefined, { maximumFractionDigits: 4 })}</div>
-          </div>
-          <div className="bg-orange-50 dark:bg-orange-500/10 rounded-xl p-3">
-            <div className="text-xs text-orange-600 dark:text-orange-400 mb-1">转出代币</div>
-            <div className="text-lg font-bold text-orange-600">{summary.totalTransferOut.toLocaleString(undefined, { maximumFractionDigits: 4 })}</div>
-          </div>
-        </div>
-        
-        {/* 估算Gas费 */}
-        {summary.gasFees > 0 && (
-          <div className="bg-slate-100 dark:bg-white/5 rounded-xl p-3 flex items-center justify-between">
-            <span className="text-sm text-slate-500">估算Gas费（{chain}）</span>
-            <span className="font-semibold">{summary.gasFees.toLocaleString(undefined, { maximumFractionDigits: 6 })} {chain}</span>
-          </div>
-        )}
-        
-        {/* 时间范围 */}
-        <div className="text-xs text-slate-400 text-center">
-          统计周期：{new Date(summary.period.start).toLocaleDateString('zh-CN')} ~ {new Date(summary.period.end).toLocaleDateString('zh-CN')}
+
+        <div className="p-5 border-t border-slate-200 dark:border-white/10 flex justify-end gap-3">
+          <button onClick={onClose} className="px-4 py-2 bg-slate-100 dark:bg-white/10 rounded-lg text-sm font-medium hover:bg-slate-200 dark:hover:bg-white/20">
+            关闭
+          </button>
+          <button onClick={handleExportCSV} className="flex items-center gap-2 px-4 py-2 bg-emerald-500 hover:bg-emerald-600 text-white rounded-lg text-sm font-medium shadow-lg shadow-emerald-500/25">
+            <Download className="w-4 h-4" /> 导出CSV
+          </button>
         </div>
       </div>
     </div>
   );
 }
 
-// ============ 资产分布图 ============
 function AllocationChart({ data, mobile }) {
   if (!data || data.length === 0) return <p className="text-xs text-slate-400 py-8 text-center">暂无资产数据</p>;
   if (mobile) {
@@ -1768,7 +1535,6 @@ function AllocationChart({ data, mobile }) {
   );
 }
 
-// ============ 单笔交易详情卡 ============
 function SingleTxCard({ tx }) {
   return (
     <div className="bg-white dark:bg-[#13111C] rounded-2xl border border-slate-200 dark:border-white/5 p-6">
@@ -1778,7 +1544,7 @@ function SingleTxCard({ tx }) {
         <span className={`ml-auto text-xs px-2 py-0.5 rounded-md font-bold ${tx.chain === 'ETH' ? 'bg-blue-100 text-blue-700' : 'bg-red-100 text-red-700'}`}>{tx.chain}</span>
       </div>
       <div className="space-y-3 text-sm">
-        <Row label="交易哈希" value={shortenAddress(tx.hash)} mono onCopy={() => copyToClipboard(tx.hash)} />
+        <Row label="交易哈希" value={shortenHash(tx.hash)} mono onCopy={() => copyToClipboard(tx.hash)} />
         <Row label="发送方" value={shortenAddress(tx.from)} mono onCopy={() => copyToClipboard(tx.from)} />
         <Row label="接收方" value={shortenAddress(tx.to)} mono onCopy={() => copyToClipboard(tx.to)} />
         <Row label="金额" value={`${tx.amount} ${tx.symbol}`} />
@@ -1804,20 +1570,15 @@ function Row({ label, value, mono, onCopy }) {
   );
 }
 
-// ============ 交易行（新增交易后余额）============
-function TxRow({ tx, currentAddress, remarkMap, onAddressClick, walletInfo }) {
-  const isOut = tx.from?.toLowerCase() === currentAddress?.toLowerCase();
-  const isIn = tx.to && tx.to.toLowerCase() === currentAddress?.toLowerCase();
+// ============ 交易行 (带变动后余额) ============
+function TxRow({ tx, currentAddress, remarkMap, onAddressClick, chain }) {
+  const isOut = tx.from?.toLowerCase() === currentAddress.toLowerCase();
+  const isIn = tx.to && tx.to.toLowerCase() === currentAddress.toLowerCase();
   const dir = isOut ? 'OUT' : isIn ? 'IN' : 'OTHER';
-  
-  // 交易后余额显示
-  const showAfterBalance = tx.afterNative !== undefined || tx.afterUsdt !== undefined;
-  const afterNative = tx.afterNative ?? 0;
-  const afterUsdt = tx.afterUsdt ?? 0;
-  const afterUsd = tx.afterUsd ?? 0;
-  
+  const postBal = tx.postBalance;
+
   return (
-    <div className="p-4 flex items-center gap-3 hover:bg-slate-50 dark:hover:bg-white/5 transition-colors">
+    <div className="p-4 flex items-start gap-3 hover:bg-slate-50 dark:hover:bg-white/5 transition-colors">
       <div className={`w-10 h-10 rounded-full flex items-center justify-center flex-shrink-0 ${
         dir === 'IN' ? 'bg-emerald-100 dark:bg-emerald-500/15' : dir === 'OUT' ? 'bg-rose-100 dark:bg-rose-500/15' : 'bg-slate-100 dark:bg-white/5'
       }`}>
@@ -1842,32 +1603,46 @@ function TxRow({ tx, currentAddress, remarkMap, onAddressClick, walletInfo }) {
         <div className="text-[11px] text-slate-400 flex items-center gap-1 justify-end mt-0.5">
           <Clock className="w-3 h-3" />{formatTime(tx.timestamp)}
         </div>
-        {/* 交易后余额 */}
-        {showAfterBalance && (
-          <div className="text-[10px] text-slate-400 mt-1 flex flex-col items-end gap-0.5">
-            {tx.type === 'TOKEN' || !tx.type ? (
-              <span>{tx.symbol}: {afterNative.toLocaleString(undefined, { maximumFractionDigits: 4 })}</span>
-            ) : null}
-            {(tx.symbol === 'USDT' || tx.type === 'TOKEN') && afterUsdt > 0 && (
-              <span>USDT: {afterUsdt.toLocaleString(undefined, { maximumFractionDigits: 2 })}</span>
-            )}
-            {afterUsd > 0 && (
-              <span className="text-emerald-500 font-medium">≈{formatCurrency(afterUsd)}</span>
-            )}
-          </div>
-        )}
         <div className="flex gap-1.5 justify-end mt-1">
-          <button onClick={() => copyToClipboard(tx.hash)} className="text-slate-300 dark:text-slate-500 hover:text-[#AB9FF2]"><Copy className="w-3.5 h-3.5" /></button>
-          <a href={tx.explorerUrl} target="_blank" rel="noreferrer" className="text-slate-300 dark:text-slate-500 hover:text-[#AB9FF2]"><ExternalLink className="w-3.5 h-3.5" /></a>
+          <button onClick={() => copyToClipboard(tx.hash)} className="text-slate-300 dark:text-slate-500 hover:text-[#AB9FF2]" title="复制哈希">
+            <Copy className="w-3.5 h-3.5" />
+          </button>
+          <a href={tx.explorerUrl} target="_blank" rel="noreferrer" className="text-slate-300 dark:text-slate-500 hover:text-[#AB9FF2]" title="浏览器查看">
+            <ExternalLink className="w-3.5 h-3.5" />
+          </a>
         </div>
       </div>
+      {/* 变动后余额 */}
+      {postBal && (
+        <div className="flex-shrink-0 bg-slate-50 dark:bg-white/5 rounded-lg p-2 text-xs min-w-[120px]">
+          <div className="text-slate-400 mb-1">变动后余额</div>
+          <div className="space-y-0.5">
+            {chain !== 'ETH' && (
+              <div className="flex justify-between gap-2">
+                <span className="text-slate-500">TRX:</span>
+                <span className="font-medium">{postBal.native.toFixed(2)}</span>
+              </div>
+            )}
+            {chain !== 'ETH' && (
+              <div className="flex justify-between gap-2">
+                <span className="text-slate-500">USDT:</span>
+                <span className="font-medium">{postBal.usdt.toFixed(2)}</span>
+              </div>
+            )}
+            <div className="flex justify-between gap-2 pt-1 border-t border-slate-200 dark:border-white/10">
+              <span className="text-slate-500">USD:</span>
+              <span className="font-medium text-[#AB9FF2]">${postBal.totalUsd.toFixed(2)}</span>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
 function AddrChip({ addr, currentAddress, remarkMap, onClick }) {
   if (!addr) return <span>-</span>;
-  const isMe = addr.toLowerCase() === currentAddress?.toLowerCase();
+  const isMe = addr.toLowerCase() === currentAddress.toLowerCase();
   const remark = remarkMap[addr.toLowerCase()];
   if (isMe) return <span className="text-slate-500 dark:text-slate-300 font-semibold">ME</span>;
   return (
@@ -1892,7 +1667,49 @@ function ListSkeleton() {
   );
 }
 
-// ============ 移动端历史列表 ============
+function HistoryCard({ item, onSelect, onUpdateRemark, onRemove }) {
+  const [editing, setEditing] = useState(false);
+  const [val, setVal] = useState(item.remark || '');
+  const save = (e) => { e.stopPropagation(); onUpdateRemark(item.address, val); setEditing(false); };
+  return (
+    <div onClick={onSelect}
+      className="group bg-slate-50 dark:bg-white/5 hover:bg-[#AB9FF2]/10 border border-transparent hover:border-[#AB9FF2]/30 rounded-xl p-3 cursor-pointer transition-all relative">
+      {/* 放大版操作按钮 */}
+      <div className="absolute top-2 right-2 flex gap-1.5 opacity-0 group-hover:opacity-100 transition-opacity">
+        <button onClick={(e) => { e.stopPropagation(); setEditing(true); setVal(item.remark || ''); }}
+          className="p-2 rounded-lg bg-blue-500 hover:bg-blue-600 text-white transition-colors shadow-md"
+          title="编辑备注">
+          <Edit2 className="w-4 h-4" />
+        </button>
+        <button onClick={(e) => { e.stopPropagation(); if(confirm('确定删除这条记录?')) onRemove(item.address); }}
+          className="p-2 rounded-lg bg-rose-500 hover:bg-rose-600 text-white transition-colors shadow-md"
+          title="删除记录">
+          <Trash2 className="w-4 h-4" />
+        </button>
+      </div>
+      <div className="flex items-center gap-2 mb-2 pr-16">
+        <span className={`text-[9px] px-1.5 py-0.5 rounded font-bold ${item.chain === 'ETH' ? 'bg-blue-100 text-blue-700' : 'bg-red-100 text-red-700'}`}>{item.chain}</span>
+        <span className="font-mono text-xs font-medium truncate">{item.ens || shortenAddress(item.address)}</span>
+      </div>
+      <div onClick={e => e.stopPropagation()}>
+        {editing ? (
+          <div className="flex items-center gap-1.5">
+            <input autoFocus value={val} onChange={e => setVal(e.target.value)} onKeyDown={e => e.key === 'Enter' && save(e)}
+              placeholder="输入备注/标签" className="flex-1 text-xs px-2 py-1.5 rounded-lg bg-white dark:bg-white/10 border border-[#AB9FF2]/40 focus:outline-none" />
+            <button onClick={save} className="p-1.5 rounded-lg text-emerald-500 hover:bg-emerald-50 dark:hover:bg-emerald-500/10"><Check className="w-4 h-4" /></button>
+          </div>
+        ) : (
+          <div className="flex items-center justify-between gap-2 text-left group/edit">
+            <span className={`text-xs truncate ${item.remark ? 'text-slate-600 dark:text-slate-300 font-medium' : 'text-slate-400'}`}>
+              {item.remark || '点击添加备注'}
+            </span>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function MobileHistoryList({ history, onJump, onUpdateRemark, onRemove }) {
   const [q, setQ] = useState('');
   const filtered = history.filter(i =>
@@ -1905,45 +1722,20 @@ function MobileHistoryList({ history, onJump, onUpdateRemark, onRemove }) {
       <h2 className="font-bold text-lg">查询记录</h2>
       <div className="relative">
         <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
-        <input value={q} onChange={e => setQ(e.target.value)} placeholder="搜索钱包地址、备注..."
+        <input value={q} onChange={e => setQ(e.target.value)} placeholder="搜索钱包地址、备注或标签..."
           className="w-full pl-10 pr-3 py-3 rounded-xl bg-slate-100 dark:bg-white/5 text-sm focus:outline-none" />
       </div>
       <div className="space-y-2">
         {filtered.length === 0 ? <p className="text-center text-slate-400 text-sm py-10">暂无历史</p>
           : filtered.map(item => (
-            <SwipeAction
-              key={item.address}
-              onEdit={() => onUpdateRemark(item)}
-              onDelete={() => onRemove(item.address)}
-              editLabel="编辑"
-              deleteLabel="删除"
-            >
-              <div onClick={() => onJump(item.address)}
-                className="bg-slate-50 dark:bg-white/5 hover:bg-[#AB9FF2]/10 border border-transparent hover:border-[#AB9FF2]/30 rounded-xl p-3 cursor-pointer transition-all">
-                <div className="flex items-center gap-2 mb-2">
-                  <span className={`text-[9px] px-1.5 py-0.5 rounded font-bold ${item.chain === 'ETH' ? 'bg-blue-100 text-blue-700' : 'bg-red-100 text-red-700'}`}>{item.chain}</span>
-                  <span className="font-mono text-xs font-medium truncate">{item.ens || shortenAddress(item.address)}</span>
-                </div>
-                <div className="flex items-center justify-between gap-2">
-                  <span className={`text-xs truncate ${item.remark ? 'text-slate-600 dark:text-slate-300 font-medium' : 'text-slate-400'}`}>
-                    {item.remark || '点击查看'}
-                  </span>
-                  {item.remark && (
-                    <button onClick={(e) => { e.stopPropagation(); onUpdateRemark(item); }}
-                      className="p-1 rounded text-slate-400 hover:text-[#AB9FF2] flex-shrink-0">
-                      <Edit2 className="w-3.5 h-3.5" />
-                    </button>
-                  )}
-                </div>
-              </div>
-            </SwipeAction>
+            <HistoryCard key={item.address} item={item} onSelect={() => onJump(item.address)}
+              onUpdateRemark={onUpdateRemark} onRemove={onRemove} />
           ))}
       </div>
     </div>
   );
 }
 
-// ============ 设置面板 ============
 function SettingsPanel({ user, onLogout, theme, setTheme, ethApiKey, setEthApiKey, trxApiKey, setTrxApiKey, onSaveKey, showKey, setShowKey }) {
   const [saved, setSaved] = useState(false);
   const handleSave = () => { onSaveKey(ethApiKey, trxApiKey); setSaved(true); setTimeout(() => setSaved(false), 2000); };
@@ -1998,7 +1790,7 @@ function SettingsPanel({ user, onLogout, theme, setTheme, ethApiKey, setEthApiKe
         <div className="space-y-5">
           <div>
             <label className="block text-sm font-medium mb-1">Etherscan API Key</label>
-            <p className="text-xs text-slate-400 mb-2">用于加速以太坊网络数据获取(选填)。</p>
+            <p className="text-xs text-slate-400 mb-2">用于加速以太坊网络数据获取(选填,留空用公共节点)。</p>
             <div className="relative">
               <input type={showKey ? 'text' : 'password'} value={ethApiKey} onChange={e => setEthApiKey(e.target.value)}
                 placeholder="留空则使用公共节点"
@@ -2010,7 +1802,7 @@ function SettingsPanel({ user, onLogout, theme, setTheme, ethApiKey, setEthApiKe
           </div>
           <div>
             <label className="block text-sm font-medium mb-1">TronScan API Key</label>
-            <p className="text-xs text-slate-400 mb-2">用于提高波场接口限额(选填)。</p>
+            <p className="text-xs text-slate-400 mb-2">用于提高波场接口限额,避免频繁查询被限流(选填,留空用公共接口)。</p>
             <input type={showKey ? 'text' : 'password'} value={trxApiKey} onChange={e => setTrxApiKey(e.target.value)}
               placeholder="留空则使用公共接口"
               className="w-full px-3 py-3 rounded-xl bg-slate-100 dark:bg-white/5 text-sm focus:outline-none focus:ring-2 focus:ring-[#AB9FF2]/40" />
@@ -2035,13 +1827,13 @@ function SettingsPanel({ user, onLogout, theme, setTheme, ethApiKey, setEthApiKe
                 <div className="text-xs text-slate-400">{n.desc}</div>
               </div>
             </div>
-            <button onClick={() => setNetworks(s => ({ ...s, [n.id]: !s[n.id] }))}
+            <button onClick={() => setNetworks(s => ({ ...s, [n.id]: !s[n.id] ))}
               className={`w-12 h-7 rounded-full transition-colors relative flex-shrink-0 ${networks[n.id] ? 'bg-[#AB9FF2]' : 'bg-slate-300 dark:bg-white/10'}`}>
               <span className={`absolute top-1 left-1 w-5 h-5 bg-white rounded-full shadow-sm transition-transform duration-200 ${networks[n.id] ? 'translate-x-5' : 'translate-x-0'}`} />
             </button>
           </div>
         ))}
-        <p className="text-[11px] text-slate-400 mt-2">更多链将在后续版本支持。</p>
+        <p className="text-[11px] text-slate-400 mt-2">更多链(BSC、Polygon 等)将在后续版本支持。</p>
       </Section>
     </div>
   );
@@ -2056,7 +1848,6 @@ function Section({ title, icon: Icon, children }) {
   );
 }
 
-// ============ 扫码弹窗 ============
 function QrScannerModal({ onClose, onScan, setError }) {
   const fileRef = useRef(null);
   useEffect(() => {
@@ -2065,7 +1856,7 @@ function QrScannerModal({ onClose, onScan, setError }) {
     qr.start({ facingMode: 'environment' }, { fps: 10, qrbox: { width: 250, height: 250 } },
       (decoded) => { qr.stop().then(() => onScan(decoded)).catch(() => onScan(decoded)); },
       () => {}
-    ).catch(err => { console.error('启动摄像头失败', err); alert('无法访问摄像头'); onClose(); });
+    ).catch(err => { console.error('启动摄像头失败', err); alert('无法访问摄像头,请检查浏览器权限设置。'); onClose(); });
     return () => { if (qr.isScanning) qr.stop().catch(() => {}); };
   }, [onClose, onScan]);
 
@@ -2078,7 +1869,7 @@ function QrScannerModal({ onClose, onScan, setError }) {
       onScan(decoded);
     } catch (err) {
       console.error('图片识别失败', err);
-      if (setError) setError('未能从图片中识别出二维码');
+      if (setError) setError('未能从图片中识别出二维码,请换一张更清晰的图片。');
       onClose();
     }
   };
@@ -2114,41 +1905,3 @@ function GoogleIcon({ size = 16 }) {
     </svg>
   );
 }
-
-// ============ 图标组件（需要根据你的项目配置）============
-// 这些图标组件需要你从 lucide-react 或其他图标库导入
-// 或者使用内联的 SVG 组件
-
-// 示例：基础图标组件（实际使用时替换为真实图标）
-const Search = ({ className }) => <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8" strokeWidth="2"/><path d="m21 21-4.35-4.35" strokeWidth="2" strokeLinecap="round"/></svg>;
-const History = ({ className }) => <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/><path d="M3 3v5h5" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/><path d="M12 7v5l4 2" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>;
-const Settings = ({ className }) => <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3" strokeWidth="2"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" strokeWidth="2"/></svg>;
-const Wallet = ({ className }) => <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M21 12V7H5a2 2 0 0 1 0-4h14v4" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/><path d="M3 5v14a2 2 0 0 0 2 2h16v-5" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/><path d="M18 12a2 2 0 0 0 0 4h4v-4Z" strokeWidth="2"/></svg>;
-const ChevronRight = ({ className }) => <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>;
-const ChevronLeft = ({ className }) => <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>;
-const Moon = ({ className }) => <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>;
-const Sun = ({ className }) => <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" strokeWidth="2"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42" strokeWidth="2" strokeLinecap="round"/></svg>;
-const Monitor = ({ className }) => <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2" ry="2" strokeWidth="2"/><path d="M8 21h8M12 17v4" strokeWidth="2" strokeLinecap="round"/></svg>;
-const Scan = ({ className }) => <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2" strokeWidth="2" strokeLinecap="round"/><rect x="7" y="7" width="10" height="10" rx="1" strokeWidth="2"/></svg>;
-const Loader2 = ({ className }) => <svg className={`animate-spin ${className}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-6.219-8.56" strokeWidth="2" strokeLinecap="round"/></svg>;
-const AlertCircle = ({ className }) => <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" strokeWidth="2"/><path d="M12 8v4M12 16h.01" strokeWidth="2" strokeLinecap="round"/></svg>;
-const X = ({ className }) => <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>;
-const DollarSign = ({ className }) => <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M12 1v22M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>;
-const FileText = ({ className }) => <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" strokeWidth="2" strokeLinejoin="round"/><path d="M14 2v6h6M16 13H8M16 17H8M10 9H8" strokeWidth="2" strokeLinecap="round"/></svg>;
-const ArrowDownRight = ({ className }) => <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M7 7h10v10M7 17 17 7" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>;
-const ArrowUpRight = ({ className }) => <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M7 17 17 7M7 7h10v10" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>;
-const Copy = ({ className }) => <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2" ry="2" strokeWidth="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" strokeWidth="2"/></svg>;
-const ExternalLink = ({ className }) => <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6M15 3h6v6M10 14 21 3" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>;
-const Clock = ({ className }) => <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" strokeWidth="2"/><path d="M12 6v6l4 2" strokeWidth="2" strokeLinecap="round"/></svg>;
-const Edit2 = ({ className }) => <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/><path d="m15 5 4 4" strokeWidth="2"/></svg>;
-const Trash2 = ({ className }) => <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M3 6h18M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/><path d="M10 11v6M14 11v6" strokeWidth="2" strokeLinecap="round"/></svg>;
-const Check = ({ className }) => <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>;
-const LogOut = ({ className }) => <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>;
-const Eye = ({ className }) => <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" strokeWidth="2"/><circle cx="12" cy="12" r="3" strokeWidth="2"/></svg>;
-const EyeOff = ({ className }) => <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24M1 1l22 22" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>;
-const Network = ({ className }) => <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24"><rect x="16" y="16" width="6" height="6" rx="1" strokeWidth="2"/><rect x="2" y="16" width="6" height="6" rx="1" strokeWidth="2"/><rect x="9" y="2" width="6" height="6" rx="1" strokeWidth="2"/><path d="M5 16v-3a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v3M12 12V8" strokeWidth="2"/></svg>;
-const ImageIcon = ({ className }) => <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2" ry="2" strokeWidth="2"/><circle cx="8.5" cy="8.5" r="1.5" strokeWidth="2"/><path d="m21 15-5-5L5 21" strokeWidth="2"/></svg>;
-const Download = ({ className }) => <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>;
-
-// React Hooks
-const { useState, useEffect, useRef, useMemo } = React || window.React || {};
