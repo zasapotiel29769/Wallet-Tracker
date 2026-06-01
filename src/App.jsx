@@ -13,10 +13,9 @@ import {
   Wallet, Settings, History, Search, Scan, Loader2, AlertCircle, X,
   DollarSign, ChevronLeft, ChevronRight, Clock, ArrowDownRight, ArrowUpRight,
   Copy, ExternalLink, Check, Edit2, Sun, Moon, Monitor, Image as ImageIcon,
-  LogOut, Eye, EyeOff, Trash2, FileText, Network, Calculator, Download, Calendar,
+  LogOut, Eye, EyeOff, Trash2, FileText, Network, Calculator, Download,
 } from 'lucide-react';
 
-// ⚠️ 换回你自己的 firebaseConfig
 const firebaseConfig = {
   apiKey: "AIzaSyBfLcdkM6CntqcPbOX42p8QXwmpsHnaKAs",
   authDomain: "wallet-checker-34d3d.firebaseapp.com",
@@ -213,22 +212,6 @@ const hexToBytes = (hex) => {
 
 const historyRef = (uid) => doc(db, 'artifacts', appId, 'users', uid, 'wallet_data', 'history');
 
-// ============ 时间工具函数 ============
-const getTimeRangeOptions = () => {
-  const now = new Date();
-  const year = now.getFullYear();
-  const month = now.getMonth();
-  
-  return {
-    currentMonth: { label: '本月', start: new Date(year, month, 1), end: new Date(year, month + 1, 0, 23, 59, 59) },
-    lastMonth: { label: '上月', start: new Date(year, month - 1, 1), end: new Date(year, month, 0, 23, 59, 59) },
-    currentQuarter: { label: '本季度', start: new Date(year, Math.floor(month / 3) * 3, 1), end: now },
-    lastQuarter: { label: '上季度', start: new Date(year, Math.floor(month / 3) * 3 - 3, 1), end: new Date(year, Math.floor(month / 3) * 3, 0, 23, 59, 59) },
-    currentYear: { label: '今年', start: new Date(year, 0, 1), end: now },
-    lastYear: { label: '去年', start: new Date(year - 1, 0, 1), end: new Date(year - 1, 11, 31, 23, 59, 59) },
-  };
-};
-
 export default function App() {
   const currentUidRef = useRef(null); 
   const [address, setAddress] = useState('');
@@ -296,7 +279,6 @@ export default function App() {
         setSingleTx(null);
       }
       currentUidRef.current = newUid;
-
       if (currentUser) {
         setUser(currentUser);
       } else {
@@ -375,9 +357,9 @@ export default function App() {
       await signInWithPopup(auth, provider);
     } catch (error) {
       console.error('Google 登录失败', error);
-      if (error.code === 'auth/unauthorized-domain') setAuthError('当前域名未加入 Firebase 授权白名单,请在 Authentication → Settings → Authorized domains 添加后重试。');
-      else if (error.code === 'auth/popup-closed-by-user') setAuthError('登录窗口被关闭,请重试。');
-      else setAuthError('登录失败,请稍后重试或检查网络环境。');
+      if (error.code === 'auth/unauthorized-domain') setAuthError('当前域名未加入 Firebase 授权白名单');
+      else if (error.code === 'auth/popup-closed-by-user') setAuthError('登录窗口被关闭');
+      else setAuthError('登录失败');
       setTimeout(() => setAuthError(''), 5000);
     }
   };
@@ -429,7 +411,7 @@ export default function App() {
     if (trxApiKey) headers['TRON-PRO-API-KEY'] = trxApiKey;
     const res = await fetch(url, { headers });
     if (res.status === 429) {
-      throw new Error('Tronscan 接口请求过于频繁,请稍候再试,或在设置中配置 TRON API Key 提高限额。');
+      throw new Error('Tronscan 接口请求过于频繁');
     }
     return res;
   };
@@ -543,7 +525,7 @@ export default function App() {
       const k = ethApiKey ? `&apikey=${ethApiKey}` : '&apikey=YourApiKeyToken';
       const res = await fetch(`https://api.etherscan.io/api?module=proxy&action=eth_getTransactionByHash&txhash=${hash}${k}`).then(r => r.json());
       const tx = res.result;
-      if (!tx) throw new Error('未找到该交易,请检查交易哈希是否正确。');
+      if (!tx) throw new Error('未找到该交易');
       return {
         hash: tx.hash, from: tx.from, to: tx.to,
         amount: formatAmount(parseInt(tx.value, 16).toString(), 18),
@@ -552,7 +534,7 @@ export default function App() {
       };
     } else {
       const res = await tronFetch(`https://apilist.tronscanapi.com/api/transaction-info?hash=${hash}`).then(r => r.json());
-      if (!res || !res.hash) throw new Error('未找到该交易,请检查交易哈希是否正确。');
+      if (!res || !res.hash) throw new Error('未找到该交易');
       return {
         hash: res.hash, from: res.ownerAddress, to: res.toAddress,
         amount: res.contractData?.amount ? formatAmount(res.contractData.amount, 6) : '-',
@@ -562,30 +544,21 @@ export default function App() {
     }
   };
 
-  // 计算每笔交易后的余额
-  const calculatePostTransactionBalances = (txs, walletInfo) => {
-    if (!txs || txs.length === 0 || !walletInfo) return txs;
-    
-    const currentNative = walletInfo.native;
-    const currentUsdt = walletInfo.usdt;
-    const price = walletInfo.price || 0;
-    const currentTotalUsd = walletInfo.totalUsd || 0;
-    
-    // 按时间正序排序用于计算
+  const calculatePostTransactionBalances = (txs, info) => {
+    if (!txs || txs.length === 0 || !info) return txs;
+    const currentNative = info.native;
+    const currentUsdt = info.usdt;
+    const price = info.price || 0;
+    const currentTotalUsd = info.totalUsd || 0;
     const sorted = [...txs].sort((a, b) => a.timestamp - b.timestamp);
-    
     let runningNative = currentNative;
     let runningUsdt = currentUsdt;
     let runningTotalUsd = currentTotalUsd;
-    
-    // 从最新到最老计算
     const reversed = [...sorted].reverse();
-    
     return reversed.map(tx => {
       const isOut = tx.from?.toLowerCase() === currentQuery.address?.toLowerCase();
       const isUsdtTx = tx.symbol === 'USDT' || tx.type === 'TOKEN';
       const amountNum = parseFloat(tx.rawAmount || 0) / Math.pow(10, tx.decimals || 18);
-      
       if (isOut) {
         if (tx.type === 'NATIVE') {
           runningNative += amountNum;
@@ -603,7 +576,6 @@ export default function App() {
           runningTotalUsd = runningNative * price + runningUsdt;
         }
       }
-      
       return {
         ...tx,
         postBalance: {
@@ -618,22 +590,18 @@ export default function App() {
   const handleSearch = async (rawInput, isLoadMore = false) => {
     const raw = (rawInput ?? address).trim();
     if (!raw) return;
-
     setSingleTx(null);
     setShowTaxReport(false);
-
     if (!isLoadMore) {
       const info = detectInputType(raw);
-
       if (info.type === 'ENS') {
         setActiveTab('search');
         setLoading(true); setError(null);
         const resolved = await resolveEns(raw);
         setLoading(false);
-        if (!resolved) { setError(`无法解析 ENS 域名 "${raw}",请确认其已绑定地址。`); return; }
+        if (!resolved) { setError(`无法解析 ENS 域名 "${raw}"`); return; }
         return doSearch(resolved, 'ETH', false, raw);
       }
-
       if (info.type === 'TX') {
         let txChain = chain === 'AUTO' ? info.chain : chain;
         setActiveTab('search');
@@ -642,21 +610,19 @@ export default function App() {
         try {
           const detail = await fetchSingleTx(raw, txChain);
           setSingleTx(detail);
-        } catch (e) { setError(e.message || '交易查询失败。'); }
+        } catch (e) { setError(e.message || '交易查询失败'); }
         finally { setLoading(false); }
         return;
       }
-
       if (info.type === 'UNKNOWN') {
-        setError('无法识别输入内容,请输入有效的钱包地址、ENS 域名或交易哈希。');
+        setError('无法识别输入内容');
         return;
       }
     }
-
     let targetChain = chain;
     if (targetChain === 'AUTO') {
       targetChain = detectChain(raw);
-      if (!targetChain) { setError('无法自动识别网络,请确认地址格式正确。'); return; }
+      if (!targetChain) { setError('无法自动识别网络'); return; }
     }
     return doSearch(raw, targetChain, isLoadMore);
   };
@@ -667,7 +633,6 @@ export default function App() {
       setError(null); setFilterType('ALL'); setCurrentPage(1); setApiPage(1);
       setActiveTab('search');
     } else setLoadingMore(true);
-
     const targetApiPage = isLoadMore ? apiPage + 1 : 1;
     try {
       if (!isLoadMore) {
@@ -678,19 +643,14 @@ export default function App() {
       let result = { txs: [], hasMore: false };
       if (targetChain === 'ETH') result = await fetchEthData(addr, targetApiPage);
       else if (targetChain === 'TRX') result = await fetchTrxData(addr, targetApiPage);
-
       const merged = isLoadMore ? [...allTransactions, ...result.txs] : result.txs;
       const unique = Array.from(new Map(merged.map(i => [i.hash + i.type, i])).values());
       unique.sort((a, b) => b.timestamp - a.timestamp);
-      
-      // 计算每笔交易后的余额
       const withBalances = calculatePostTransactionBalances(unique, walletInfo);
-      
       setAllTransactions(withBalances);
       setHasMoreData(result.hasMore);
       setApiPage(targetApiPage);
       setCurrentQuery({ address: addr.toLowerCase(), chain: targetChain, ens: ensName || null });
-
       if (!isLoadMore) {
         setHistory((prev) => {
           const exist = prev.find(i => i.address.toLowerCase() === addr.toLowerCase());
@@ -702,7 +662,7 @@ export default function App() {
         });
       }
     } catch (e) {
-      if (!isLoadMore) { setError(e.message || '查询失败,请检查地址或网络状态。'); setFetchingBalance(false); }
+      if (!isLoadMore) { setError(e.message || '查询失败'); setFetchingBalance(false); }
     } finally { setLoading(false); setLoadingMore(false); }
   };
 
@@ -757,12 +717,6 @@ export default function App() {
     });
   }, [allTransactions, currentQuery.address, filterType]);
 
-  // 计算税务报表数据
-  const taxReportData = useMemo(() => {
-    if (!showTaxReport || !currentQuery.address || filteredTransactions.length === 0) return null;
-    return filteredTransactions;
-  }, [showTaxReport, filteredTransactions, currentQuery.address]);
-
   const totalPages = Math.ceil(filteredTransactions.length / PAGE_SIZE) || 1;
   const paginated = filteredTransactions.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
 
@@ -789,7 +743,7 @@ export default function App() {
     filterType, setFilterType, paginated, remarkMap, jumpToAddress,
     currentPage, setCurrentPage, totalPages, filteredTransactions,
     hasMoreData, loadingMore, isMobile, setShowScanner,
-    showTaxReport, setShowTaxReport, taxReportData,
+    showTaxReport, setShowTaxReport,
     history, onUpdateRemark: updateRemark, onRemove: removeHistory,
   };
 
@@ -803,12 +757,10 @@ export default function App() {
     <div className="min-h-screen bg-[#F7F7FB] dark:bg-[#0B0E14] text-slate-800 dark:text-slate-100 transition-colors"
       style={{ paddingTop: 'env(safe-area-inset-top)', paddingBottom: 'env(safe-area-inset-bottom)' }}>
       <GlobalStyles />
-
       <div className="hidden lg:flex h-screen overflow-hidden">
         <Sidebar collapsed={sidebarCollapsed} onToggle={() => setSidebarCollapsed(v => !v)}
           activeTab={activeTab} setActiveTab={setActiveTab} history={sortedHistory}
           onJump={jumpToAddress} onUpdateRemark={updateRemark} onRemove={removeHistory} />
-
         <div className="flex-1 flex flex-col overflow-hidden">
           <TopBar user={user} onLogin={handleGoogleLogin} onLogout={handleLogout}
             theme={theme} setTheme={setTheme} onOpenSettings={() => setActiveTab('settings')} />
@@ -819,7 +771,6 @@ export default function App() {
           </div>
         </div>
       </div>
-
       <div className="lg:hidden flex flex-col min-h-screen pb-20">
         <MobileHeader user={user} onLogin={handleGoogleLogin}
           theme={theme} setTheme={setTheme} onAvatar={() => setActiveTab('settings')} />
@@ -833,7 +784,6 @@ export default function App() {
         </div>
         <MobileTabBar activeTab={activeTab} setActiveTab={setActiveTab} />
       </div>
-
       {authError && (
         <div className="fixed top-6 right-4 z-[80] p-4 bg-white dark:bg-[#1A1726] border-l-4 border-rose-500 rounded-xl shadow-2xl flex items-start gap-3 w-[300px] animate-[slideIn_0.3s_ease-out]">
           <AlertCircle className="w-5 h-5 text-rose-500 flex-shrink-0 mt-0.5" />
@@ -844,7 +794,6 @@ export default function App() {
           <button onClick={() => setAuthError('')} className="text-slate-400 hover:text-rose-500"><X className="w-4 h-4" /></button>
         </div>
       )}
-
       {showScanner && <QrScannerModal onClose={() => setShowScanner(false)} onScan={handleScan} setError={setError} />}
     </div>
   );
@@ -886,7 +835,6 @@ function Sidebar({ collapsed, onToggle, activeTab, setActiveTab, history, onJump
           </div>
         )}
       </div>
-
       <nav className="p-3 space-y-1">
         {navItems.map(({ id, label, icon: Icon }) => (
           <button key={id} onClick={() => setActiveTab(id)}
@@ -898,7 +846,6 @@ function Sidebar({ collapsed, onToggle, activeTab, setActiveTab, history, onJump
           </button>
         ))}
       </nav>
-
       {!collapsed && (
         <div className="flex-1 overflow-y-auto px-3 pb-3 hide-scrollbar">
           <div className="text-[11px] font-semibold text-slate-400 px-3 py-2 uppercase tracking-wider">查询记录</div>
@@ -912,7 +859,6 @@ function Sidebar({ collapsed, onToggle, activeTab, setActiveTab, history, onJump
           </div>
         </div>
       )}
-
       <button onClick={onToggle}
         className="m-3 p-2 rounded-xl text-slate-400 hover:bg-slate-100 dark:hover:bg-white/5 flex items-center justify-center">
         {collapsed ? <ChevronRight className="w-5 h-5" /> : <ChevronLeft className="w-5 h-5" />}
@@ -1012,7 +958,7 @@ function MainContent(props) {
     currentQuery, fetchingBalance, walletInfo, allocation, filterType, setFilterType,
     paginated, remarkMap, jumpToAddress, currentPage, setCurrentPage, totalPages,
     filteredTransactions, hasMoreData, loadingMore, isMobile, setShowScanner, isMobileLayout,
-    showTaxReport, setShowTaxReport, taxReportData,
+    showTaxReport, setShowTaxReport,
     history, onUpdateRemark, onRemove,
   } = props;
 
@@ -1050,7 +996,7 @@ function MainContent(props) {
               placeholder="钱包地址、ENS 域名 或交易哈希"
               className="w-full pl-10 pr-12 py-3 rounded-xl bg-slate-100 dark:bg-white/5 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-[#AB9FF2]/40 placeholder:font-sans placeholder:text-slate-400" />
             {isMobile && (
-              <button onClick={() => { if (!window.Html5Qrcode) { alert('扫码组件加载中,请稍候'); return; } setShowScanner(true); }}
+              <button onClick={() => { if (!window.Html5Qrcode) { alert('扫码组件加载中'); return; } setShowScanner(true); }}
                 className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-[#AB9FF2]">
                 <Scan className="w-5 h-5" />
               </button>
@@ -1102,11 +1048,9 @@ function MainContent(props) {
         </div>
       )}
 
-      {/* 操作按钮和备注区域 - 仅在查询到地址时显示 */}
       {currentQuery.address && !error && !singleTx && (
         <div className="bg-white dark:bg-[#13111C] rounded-2xl border border-slate-200 dark:border-white/5 p-4">
           <div className="flex flex-col sm:flex-row items-start sm:items-center gap-4">
-            {/* 备注显示/编辑 */}
             <div className="flex-1 min-w-0">
               {editingRemark ? (
                 <div className="flex items-center gap-2">
@@ -1143,8 +1087,6 @@ function MainContent(props) {
                 </div>
               )}
             </div>
-            
-            {/* 操作按钮 */}
             <div className="flex items-center gap-2 flex-shrink-0">
               <button onClick={handleEditRemark} className="flex items-center gap-2 px-4 py-2.5 bg-blue-500 hover:bg-blue-600 text-white rounded-xl text-sm font-medium shadow-lg shadow-blue-500/25 transition-all">
                 <Edit2 className="w-4 h-4" /> 编辑备注
@@ -1157,7 +1099,6 @@ function MainContent(props) {
         </div>
       )}
 
-      {/* 税务报表弹窗 */}
       {showTaxReport && currentQuery.address && (
         <TaxReportModal
           transactions={filteredTransactions}
@@ -1187,7 +1128,6 @@ function MainContent(props) {
               <span className="font-mono">{shortenAddress(currentQuery.address)}</span>
             </div>
           </div>
-
           <div className="divide-y divide-slate-100 dark:divide-white/5">
             {loading ? <ListSkeleton />
               : paginated.length === 0 ? <div className="py-16 text-center text-slate-400 text-sm">该分类下未找到交易记录</div>
@@ -1196,7 +1136,6 @@ function MainContent(props) {
                   remarkMap={remarkMap} onAddressClick={jumpToAddress} chain={currentQuery.chain} />
               ))}
           </div>
-
           {!loading && (
             <div className="p-4 border-t border-slate-100 dark:border-white/5 flex items-center justify-between gap-3 flex-wrap">
               <span className="text-xs text-slate-400">{currentPage} / {totalPages} 页 · 共 {filteredTransactions.length} 条</span>
@@ -1232,13 +1171,11 @@ function MainContent(props) {
   );
 }
 
-// ============ 税务报表弹窗 ============
 function TaxReportModal({ transactions, walletInfo, currentAddress, onClose }) {
-  const [reportType, setReportType] = useState('month'); // month, quarter, year
+  const [reportType, setReportType] = useState('month');
   const [selectedYear, setSelectedYear] = useState(new Date().getFullYear());
   const [selectedMonth, setSelectedMonth] = useState(new Date().getMonth() + 1);
   const [selectedQuarter, setSelectedQuarter] = useState(Math.floor(new Date().getMonth() / 3) + 1);
-  const [showExport, setShowExport] = useState(false);
 
   const years = Array.from({ length: 5 }, (_, i) => new Date().getFullYear() - i);
   const months = Array.from({ length: 12 }, (_, i) => i + 1);
@@ -1278,8 +1215,8 @@ function TaxReportModal({ transactions, walletInfo, currentAddress, onClose }) {
   }, [transactions, start, end]);
 
   const reportData = useMemo(() => {
-    let totalInflow = 0; // 转入总额(USD)
-    let totalOutflow = 0; // 转出总额(USD)
+    let totalInflow = 0;
+    let totalOutflow = 0;
     let trxInflow = 0;
     let trxOutflow = 0;
     let usdtInflow = 0;
@@ -1439,7 +1376,7 @@ function TaxReportModal({ transactions, walletInfo, currentAddress, onClose }) {
 
           <div className="bg-gradient-to-br from-[#6E5FE0] to-[#4B3FC0] rounded-xl p-4 text-white">
             <div className="text-white/70 text-xs mb-1">净流动 (USD)</div>
-            <div className="text-2xl font-bold ${reportData.netFlow >= 0 ? '' : 'text-rose-200'}">
+            <div className="text-2xl font-bold">
               ${reportData.netFlow.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
             </div>
           </div>
@@ -1570,7 +1507,6 @@ function Row({ label, value, mono, onCopy }) {
   );
 }
 
-// ============ 交易行 (带变动后余额) ============
 function TxRow({ tx, currentAddress, remarkMap, onAddressClick, chain }) {
   const isOut = tx.from?.toLowerCase() === currentAddress.toLowerCase();
   const isIn = tx.to && tx.to.toLowerCase() === currentAddress.toLowerCase();
@@ -1612,7 +1548,6 @@ function TxRow({ tx, currentAddress, remarkMap, onAddressClick, chain }) {
           </a>
         </div>
       </div>
-      {/* 变动后余额 */}
       {postBal && (
         <div className="flex-shrink-0 bg-slate-50 dark:bg-white/5 rounded-lg p-2 text-xs min-w-[120px]">
           <div className="text-slate-400 mb-1">变动后余额</div>
@@ -1674,7 +1609,6 @@ function HistoryCard({ item, onSelect, onUpdateRemark, onRemove }) {
   return (
     <div onClick={onSelect}
       className="group bg-slate-50 dark:bg-white/5 hover:bg-[#AB9FF2]/10 border border-transparent hover:border-[#AB9FF2]/30 rounded-xl p-3 cursor-pointer transition-all relative">
-      {/* 放大版操作按钮 */}
       <div className="absolute top-2 right-2 flex gap-1.5 opacity-0 group-hover:opacity-100 transition-opacity">
         <button onClick={(e) => { e.stopPropagation(); setEditing(true); setVal(item.remark || ''); }}
           className="p-2 rounded-lg bg-blue-500 hover:bg-blue-600 text-white transition-colors shadow-md"
@@ -1745,6 +1679,11 @@ function SettingsPanel({ user, onLogout, theme, setTheme, ethApiKey, setEthApiKe
     { id: 'system', label: '跟随系统', icon: Monitor },
   ];
   const [networks, setNetworks] = useState({ ETH: true, TRX: true });
+
+  const toggleNetwork = (id) => {
+    setNetworks(prev => ({ ...prev, [id]: !prev[id] }));
+  };
+
   return (
     <div className="max-w-2xl mx-auto space-y-5">
       <div>
@@ -1827,7 +1766,7 @@ function SettingsPanel({ user, onLogout, theme, setTheme, ethApiKey, setEthApiKe
                 <div className="text-xs text-slate-400">{n.desc}</div>
               </div>
             </div>
-            <button onClick={() => setNetworks(s => ({ ...s, [n.id]: !s[n.id] ))}
+            <button onClick={() => toggleNetwork(n.id)}
               className={`w-12 h-7 rounded-full transition-colors relative flex-shrink-0 ${networks[n.id] ? 'bg-[#AB9FF2]' : 'bg-slate-300 dark:bg-white/10'}`}>
               <span className={`absolute top-1 left-1 w-5 h-5 bg-white rounded-full shadow-sm transition-transform duration-200 ${networks[n.id] ? 'translate-x-5' : 'translate-x-0'}`} />
             </button>
@@ -1856,7 +1795,7 @@ function QrScannerModal({ onClose, onScan, setError }) {
     qr.start({ facingMode: 'environment' }, { fps: 10, qrbox: { width: 250, height: 250 } },
       (decoded) => { qr.stop().then(() => onScan(decoded)).catch(() => onScan(decoded)); },
       () => {}
-    ).catch(err => { console.error('启动摄像头失败', err); alert('无法访问摄像头,请检查浏览器权限设置。'); onClose(); });
+    ).catch(err => { console.error('启动摄像头失败', err); alert('无法访问摄像头'); onClose(); });
     return () => { if (qr.isScanning) qr.stop().catch(() => {}); };
   }, [onClose, onScan]);
 
@@ -1869,7 +1808,7 @@ function QrScannerModal({ onClose, onScan, setError }) {
       onScan(decoded);
     } catch (err) {
       console.error('图片识别失败', err);
-      if (setError) setError('未能从图片中识别出二维码,请换一张更清晰的图片。');
+      if (setError) setError('未能从图片中识别出二维码');
       onClose();
     }
   };
