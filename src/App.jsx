@@ -13,7 +13,7 @@ import {
   Wallet, Settings, History, Search, Scan, Loader2, AlertCircle, X,
   DollarSign, ChevronLeft, ChevronRight, Clock, ArrowDownRight, ArrowUpRight,
   Copy, ExternalLink, Check, Edit2, Sun, Moon, Monitor, Image as ImageIcon,
-  LogOut, Plus, Eye, EyeOff, Trash2, Home, FileText, Network,
+  LogOut, Eye, EyeOff, Trash2, FileText, Network,
 } from 'lucide-react';
 
 // ⚠️ 换回你自己的 firebaseConfig
@@ -74,6 +74,14 @@ const parseQrAddress = (text) => {
   return addr.trim();
 };
 
+// 清除对象里的 undefined,避免 Firestore 报错
+const cleanForFirestore = (items) =>
+  items.map((item) => {
+    const o = {};
+    Object.keys(item).forEach((k) => { if (item[k] !== undefined) o[k] = item[k]; });
+    return o;
+  });
+
 // 输入类型智能识别
 const detectInputType = (raw) => {
   const v = raw.trim();
@@ -90,13 +98,11 @@ const detectInputType = (raw) => {
 const resolveEns = async (name) => {
   try {
     const namehash = await ensNamehash(name);
-    // ENS Registry: resolver(bytes32)
     const registry = '0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e';
     const resolverData = '0x0178b8bf' + namehash.slice(2);
     const resolverAddr = await ethCall(registry, resolverData);
     const resolver = '0x' + resolverAddr.slice(-40);
     if (/^0x0+$/.test(resolver)) return null;
-    // resolver.addr(bytes32)
     const addrData = '0x3b3b57de' + namehash.slice(2);
     const addrRes = await ethCall(resolver, addrData);
     const addr = '0x' + addrRes.slice(-40);
@@ -111,16 +117,12 @@ const ethCall = async (to, data) => {
   const res = await fetch(ENS_RPC, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      jsonrpc: '2.0', id: 1, method: 'eth_call',
-      params: [{ to, data }, 'latest'],
-    }),
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_call', params: [{ to, data }, 'latest'] }),
   });
   const json = await res.json();
   return json.result || '0x';
 };
 
-// 计算 ENS namehash(keccak256)
 const ensNamehash = async (name) => {
   let node = '0x0000000000000000000000000000000000000000000000000000000000000000';
   const labels = name.toLowerCase().split('.');
@@ -131,9 +133,7 @@ const ensNamehash = async (name) => {
   return node;
 };
 
-// 轻量 keccak256(用于 ENS namehash)
 const keccak256 = (() => {
-  // 精简版 keccak-256 实现
   const RC = [
     [0,1],[0x8082,0],[0x808a,0x80000000],[0x80008000,0x80000000],[0x808b,0],[0x80000001,0],
     [0x80008081,0x80000000],[0x8009,0x80000000],[0x8a,0],[0x88,0],[0x80008009,0],[0x8000000a,0],
@@ -208,15 +208,6 @@ const hexToBytes = (hex) => {
 
 const historyRef = (uid) => doc(db, 'artifacts', appId, 'users', uid, 'wallet_data', 'history');
 
-// 清除对象里的 undefined,避免 Firestore 报错
-const cleanForFirestore = (items) =>
-  items.map(item => {
-    const o = {};
-    Object.keys(item).forEach(k => { if (item[k] !== undefined) o[k] = item[k]; });
-    return o;
-  });
-
-
 export default function App() {
   const [address, setAddress] = useState('');
   const [chain, setChain] = useState('AUTO');
@@ -232,18 +223,17 @@ export default function App() {
   const [fetchingBalance, setFetchingBalance] = useState(false);
   const [history, setHistory] = useState([]);
   const [ethApiKey, setEthApiKey] = useState('');
+  const [trxApiKey, setTrxApiKey] = useState('');
   const [filterType, setFilterType] = useState('ALL');
   const [isMobile, setIsMobile] = useState(false);
   const [showScanner, setShowScanner] = useState(false);
   const [user, setUser] = useState(null);
   const [authError, setAuthError] = useState('');
 
-  // 新增 UI 状态
-  const [theme, setTheme] = useState('dark'); // dark | light | system
-  const [activeTab, setActiveTab] = useState('search'); // search | history | settings
-  const [drawerOpen, setDrawerOpen] = useState(false); // 移动端历史抽屉
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false); // 桌面侧栏折叠
-  const [singleTx, setSingleTx] = useState(null); // 单笔交易详情
+  const [theme, setTheme] = useState('dark');
+  const [activeTab, setActiveTab] = useState('search');
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [singleTx, setSingleTx] = useState(null);
   const [showKey, setShowKey] = useState(false);
 
   // ============ 主题 ============
@@ -293,6 +283,8 @@ export default function App() {
     try {
       const savedKey = localStorage.getItem('eth_api_key');
       if (savedKey) setEthApiKey(savedKey);
+      const savedTrxKey = localStorage.getItem('trx_api_key');
+      if (savedTrxKey) setTrxApiKey(savedTrxKey);
     } catch (e) {}
 
     if (!user) return;
@@ -305,7 +297,7 @@ export default function App() {
           if (local) {
             const parsed = JSON.parse(local);
             setHistory(parsed);
-            setDoc(ref, { items: parsed }).catch(console.error);
+            setDoc(ref, { items: cleanForFirestore(parsed) }).catch(console.error);
             localStorage.removeItem('wallet_history');
           }
         } catch (e) {}
@@ -332,7 +324,7 @@ export default function App() {
         });
       });
       const merged = Array.from(map.values()).sort((a, b) => (b.lastQueried || 0) - (a.lastQueried || 0));
-      await setDoc(newRef, { items: merged });
+      await setDoc(newRef, { items: cleanForFirestore(merged) });
     } catch (e) { console.error('历史迁移失败', e); }
   };
 
@@ -395,6 +387,17 @@ export default function App() {
     return null;
   };
 
+  // Tronscan 请求:有 Key 就带上提高限额,没 Key 也能正常用(公共接口)
+  const tronFetch = async (url) => {
+    const headers = {};
+    if (trxApiKey) headers['TRON-PRO-API-KEY'] = trxApiKey;
+    const res = await fetch(url, { headers });
+    if (res.status === 429) {
+      throw new Error('Tronscan 接口请求过于频繁,请稍候再试,或在设置中配置 TRON API Key 提高限额。');
+    }
+    return res;
+  };
+
   // ============ 余额 ============
   const fetchWalletBalance = async (addr, targetChain) => {
     let native = 0, usdt = 0, price = 0;
@@ -411,7 +414,7 @@ export default function App() {
         price = parseFloat(p.price || 0);
       } else if (targetChain === 'TRX') {
         const [a, p] = await Promise.all([
-          fetch(`https://apilist.tronscanapi.com/api/account?address=${addr}`).then(r => r.json()),
+          tronFetch(`https://apilist.tronscanapi.com/api/account?address=${addr}`).then(r => r.json()),
           fetch('https://api.binance.com/api/v3/ticker/price?symbol=TRXUSDT').then(r => r.json()).catch(() => ({ price: 0 })),
         ]);
         native = (a.balance || 0) / 1e6;
@@ -464,8 +467,8 @@ export default function App() {
   const fetchTrxData = async (q, pageNum) => {
     const start = (pageNum - 1) * FETCH_LIMIT;
     const [nR, tR] = await Promise.all([
-      fetch(`https://apilist.tronscanapi.com/api/transaction?sort=-timestamp&count=true&limit=${FETCH_LIMIT}&start=${start}&address=${q}`),
-      fetch(`https://apilist.tronscanapi.com/api/token_trc20/transfers?limit=${FETCH_LIMIT}&start=${start}&sort=-timestamp&count=true&relatedAddress=${q}`),
+      tronFetch(`https://apilist.tronscanapi.com/api/transaction?sort=-timestamp&count=true&limit=${FETCH_LIMIT}&start=${start}&address=${q}`),
+      tronFetch(`https://apilist.tronscanapi.com/api/token_trc20/transfers?limit=${FETCH_LIMIT}&start=${start}&sort=-timestamp&count=true&relatedAddress=${q}`),
     ]);
     if (!nR.ok || !tR.ok) throw new Error('Tronscan API 请求失败');
     const nD = await nR.json();
@@ -512,7 +515,7 @@ export default function App() {
         explorerUrl: `https://etherscan.io/tx/${tx.hash}`,
       };
     } else {
-      const res = await fetch(`https://apilist.tronscanapi.com/api/transaction-info?hash=${hash}`).then(r => r.json());
+      const res = await tronFetch(`https://apilist.tronscanapi.com/api/transaction-info?hash=${hash}`).then(r => r.json());
       if (!res || !res.hash) throw new Error('未找到该交易,请检查交易哈希是否正确。');
       return {
         hash: res.hash, from: res.ownerAddress, to: res.toAddress,
@@ -530,12 +533,11 @@ export default function App() {
 
     setSingleTx(null);
 
-    // 智能识别输入
     if (!isLoadMore) {
       const info = detectInputType(raw);
 
-      // ENS 解析
       if (info.type === 'ENS') {
+        setActiveTab('search');
         setLoading(true); setError(null);
         const resolved = await resolveEns(raw);
         setLoading(false);
@@ -543,9 +545,9 @@ export default function App() {
         return doSearch(resolved, 'ETH', false, raw);
       }
 
-      // 交易哈希
       if (info.type === 'TX') {
         let txChain = chain === 'AUTO' ? info.chain : chain;
+        setActiveTab('search');
         setLoading(true); setError(null); setWalletInfo(null);
         setCurrentQuery({ address: '', chain: '' }); setAllTransactions([]);
         try {
@@ -562,7 +564,6 @@ export default function App() {
       }
     }
 
-    // 普通地址查询
     let targetChain = chain;
     if (targetChain === 'AUTO') {
       targetChain = detectChain(raw);
@@ -572,28 +573,11 @@ export default function App() {
   };
 
   const doSearch = async (addr, targetChain, isLoadMore, ensName = null) => {
-      
-      if (!isLoadMore) {
-          setHistory((prev) => {
-            const exist = prev.find(i => i.address.toLowerCase() === addr.toLowerCase());
-            let nh;
-            if (exist) {
-              nh = [
-                { ...exist, lastQueried: Date.now(), ens: ensName || exist.ens || null },
-                ...prev.filter(i => i.address.toLowerCase() !== addr.toLowerCase())
-              ];
-            } else {
-              nh = [
-                { address: addr, chain: targetChain, remark: '', ens: ensName || null, lastQueried: Date.now() },
-                ...prev
-              ];
-            }
-            if (user) setDoc(historyRef(user.uid), { items: cleanForFirestore(nh) }).catch(console.error);
-            return nh;
-          });
-        }
-
-     
+    if (!isLoadMore) {
+      setLoading(true); setFetchingBalance(true); setWalletInfo(null);
+      setError(null); setFilterType('ALL'); setCurrentPage(1); setApiPage(1);
+      setActiveTab('search');
+    } else setLoadingMore(true);
 
     const targetApiPage = isLoadMore ? apiPage + 1 : 1;
     try {
@@ -612,14 +596,14 @@ export default function App() {
       setAllTransactions(unique);
       setHasMoreData(result.hasMore);
       setApiPage(targetApiPage);
-      setCurrentQuery({ address: addr.toLowerCase(), chain: targetChain, ens: ensName });
+      setCurrentQuery({ address: addr.toLowerCase(), chain: targetChain, ens: ensName || null });
 
       if (!isLoadMore) {
         setHistory((prev) => {
           const exist = prev.find(i => i.address.toLowerCase() === addr.toLowerCase());
           let nh;
-          if (exist) nh = [{ ...exist, lastQueried: Date.now(), ens: ensName || exist.ens }, ...prev.filter(i => i.address.toLowerCase() !== addr.toLowerCase())];
-          else nh = [{ address: addr, chain: targetChain, remark: '', ens: ensName, lastQueried: Date.now() }, ...prev];
+          if (exist) nh = [{ ...exist, lastQueried: Date.now(), ens: ensName || exist.ens || null }, ...prev.filter(i => i.address.toLowerCase() !== addr.toLowerCase())];
+          else nh = [{ address: addr, chain: targetChain, remark: '', ens: ensName || null, lastQueried: Date.now() }, ...prev];
           if (user) setDoc(historyRef(user.uid), { items: cleanForFirestore(nh) }).catch(console.error);
           return nh;
         });
@@ -630,11 +614,11 @@ export default function App() {
   };
 
   const jumpToAddress = (addr) => {
+    setActiveTab('search'); // 关键:强制切回查询页
     setAddress(addr);
     const d = detectChain(addr);
     if (d) setChain(d);
     handleSearch(addr, false);
-    setDrawerOpen(false);
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
@@ -643,9 +627,11 @@ export default function App() {
     jumpToAddress(parseQrAddress(text));
   };
 
-  const saveApiKey = (key) => {
-    setEthApiKey(key);
-    localStorage.setItem('eth_api_key', key);
+  const saveApiKey = (ethKey, trxKey) => {
+    setEthApiKey(ethKey);
+    setTrxApiKey(trxKey);
+    localStorage.setItem('eth_api_key', ethKey || '');
+    localStorage.setItem('trx_api_key', trxKey || '');
   };
 
   const updateRemark = (addr, rmk) => {
@@ -681,7 +667,6 @@ export default function App() {
   const totalPages = Math.ceil(filteredTransactions.length / PAGE_SIZE) || 1;
   const paginated = filteredTransactions.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
 
-  // 资产分布数据(真实数据:主币/USDT/其他估算)
   const allocation = useMemo(() => {
     if (!walletInfo) return [];
     const nativeUsd = walletInfo.native * walletInfo.price;
@@ -699,6 +684,20 @@ export default function App() {
     [history]
   );
 
+  const mainContentProps = {
+    chain, setChain, address, setAddress, handleSearch, loading,
+    error, singleTx, currentQuery, fetchingBalance, walletInfo, allocation,
+    filterType, setFilterType, paginated, remarkMap, jumpToAddress,
+    currentPage, setCurrentPage, totalPages, filteredTransactions,
+    hasMoreData, loadingMore, isMobile, setShowScanner,
+  };
+
+  const settingsProps = {
+    user, onLogout: handleLogout, theme, setTheme,
+    ethApiKey, setEthApiKey, trxApiKey, setTrxApiKey,
+    onSaveKey: saveApiKey, showKey, setShowKey,
+  };
+
   // ============ 渲染 ============
   return (
     <div className="min-h-screen bg-[#F7F7FB] dark:bg-[#0B0E14] text-slate-800 dark:text-slate-100 transition-colors"
@@ -707,36 +706,17 @@ export default function App() {
 
       {/* ===== 桌面布局 ===== */}
       <div className="hidden lg:flex h-screen overflow-hidden">
-        {/* 侧边导航 */}
-        <Sidebar
-          collapsed={sidebarCollapsed}
-          onToggle={() => setSidebarCollapsed(v => !v)}
-          activeTab={activeTab}
-          setActiveTab={setActiveTab}
-          history={sortedHistory}
-          onJump={jumpToAddress}
-          onUpdateRemark={updateRemark}
-          onRemove={removeHistory}
-        />
+        <Sidebar collapsed={sidebarCollapsed} onToggle={() => setSidebarCollapsed(v => !v)}
+          activeTab={activeTab} setActiveTab={setActiveTab} history={sortedHistory}
+          onJump={jumpToAddress} onUpdateRemark={updateRemark} onRemove={removeHistory} />
 
-        {/* 主区 */}
         <div className="flex-1 flex flex-col overflow-hidden">
           <TopBar user={user} onLogin={handleGoogleLogin} onLogout={handleLogout}
             theme={theme} setTheme={setTheme} onOpenSettings={() => setActiveTab('settings')} />
-          <div className="flex-1 overflow-y-auto px-8 py-6">
-            {activeTab === 'settings' ? (
-              <SettingsPanel user={user} onLogout={handleLogout} theme={theme} setTheme={setTheme}
-                ethApiKey={ethApiKey} setEthApiKey={setEthApiKey} onSaveKey={saveApiKey}
-                showKey={showKey} setShowKey={setShowKey} />
-            ) : (
-              <MainContent {...{
-                chain, setChain, address, setAddress, handleSearch, loading,
-                error, singleTx, currentQuery, fetchingBalance, walletInfo, allocation,
-                filterType, setFilterType, paginated, remarkMap, jumpToAddress,
-                currentPage, setCurrentPage, totalPages, filteredTransactions,
-                hasMoreData, loadingMore, isMobile, setShowScanner,
-              }} isMobileLayout={false} />
-            )}
+          <div key={activeTab} className="flex-1 overflow-y-auto px-8 py-6 page-enter">
+            {activeTab === 'settings'
+              ? <SettingsPanel {...settingsProps} />
+              : <MainContent {...mainContentProps} isMobileLayout={false} />}
           </div>
         </div>
       </div>
@@ -745,28 +725,17 @@ export default function App() {
       <div className="lg:hidden flex flex-col min-h-screen pb-20">
         <MobileHeader user={user} onLogin={handleGoogleLogin}
           theme={theme} setTheme={setTheme} onAvatar={() => setActiveTab('settings')} />
-        <div className="flex-1 px-4 py-4">
-          {activeTab === 'settings' ? (
-            <SettingsPanel user={user} onLogout={handleLogout} theme={theme} setTheme={setTheme}
-              ethApiKey={ethApiKey} setEthApiKey={setEthApiKey} onSaveKey={saveApiKey}
-              showKey={showKey} setShowKey={setShowKey} />
-          ) : activeTab === 'history' ? (
-            <MobileHistoryList history={sortedHistory} onJump={jumpToAddress}
-              onUpdateRemark={updateRemark} onRemove={removeHistory} />
-          ) : (
-            <MainContent {...{
-              chain, setChain, address, setAddress, handleSearch, loading,
-              error, singleTx, currentQuery, fetchingBalance, walletInfo, allocation,
-              filterType, setFilterType, paginated, remarkMap, jumpToAddress,
-              currentPage, setCurrentPage, totalPages, filteredTransactions,
-              hasMoreData, loadingMore, isMobile, setShowScanner,
-            }} isMobileLayout={true} />
-          )}
+        <div key={activeTab} className="flex-1 px-4 py-4 page-enter">
+          {activeTab === 'settings'
+            ? <SettingsPanel {...settingsProps} />
+            : activeTab === 'history'
+            ? <MobileHistoryList history={sortedHistory} onJump={jumpToAddress}
+                onUpdateRemark={updateRemark} onRemove={removeHistory} />
+            : <MainContent {...mainContentProps} isMobileLayout={true} />}
         </div>
         <MobileTabBar activeTab={activeTab} setActiveTab={setActiveTab} />
       </div>
 
-      {/* 登录错误提示 */}
       {authError && (
         <div className="fixed top-6 right-4 z-[80] p-4 bg-white dark:bg-[#1A1726] border-l-4 border-rose-500 rounded-xl shadow-2xl flex items-start gap-3 w-[300px] animate-[slideIn_0.3s_ease-out]">
           <AlertCircle className="w-5 h-5 text-rose-500 flex-shrink-0 mt-0.5" />
@@ -783,7 +752,7 @@ export default function App() {
   );
 }
 
-// ============ 全局样式(主题变量 + 移动端原生化)============
+// ============ 全局样式 ============
 function GlobalStyles() {
   return (
     <style>{`
@@ -793,7 +762,8 @@ function GlobalStyles() {
       input, textarea { -webkit-user-select: text; user-select: text; }
       @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
       @keyframes scan { 0%,100% { top: 4%; } 50% { top: 92%; } }
-      @keyframes sheetUp { from { transform: translateY(100%); } to { transform: translateY(0); } }
+      @keyframes fadeUp { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+      .page-enter { animation: fadeUp 0.25s ease-out; }
       .hide-scrollbar::-webkit-scrollbar { display: none; }
       .hide-scrollbar { scrollbar-width: none; }
     `}</style>
@@ -840,8 +810,7 @@ function Sidebar({ collapsed, onToggle, activeTab, setActiveTab, history, onJump
             {history.length === 0 ? (
               <p className="text-xs text-slate-400 px-3 py-4 text-center">暂无历史</p>
             ) : history.map(item => (
-              <HistoryCard key={item.address} item={item}
-                onSelect={() => onJump(item.address)}
+              <HistoryCard key={item.address} item={item} onSelect={() => onJump(item.address)}
                 onUpdateRemark={onUpdateRemark} onRemove={onRemove} compact />
             ))}
           </div>
@@ -945,7 +914,7 @@ function MobileTabBar({ activeTab, setActiveTab }) {
   );
 }
 
-// ============ 主内容(查询+资产+交易)============
+// ============ 主内容 ============
 function MainContent(props) {
   const {
     chain, setChain, address, setAddress, handleSearch, loading, error, singleTx,
@@ -956,7 +925,6 @@ function MainContent(props) {
 
   return (
     <div className="max-w-5xl mx-auto space-y-5">
-      {/* 查询框 */}
       <div className="bg-white dark:bg-[#13111C] rounded-2xl border border-slate-200 dark:border-white/5 p-4">
         {!isMobileLayout && <h2 className="font-bold text-lg mb-3">探索链上数据</h2>}
         <div className="flex flex-col sm:flex-row gap-2">
@@ -994,23 +962,18 @@ function MainContent(props) {
         </div>
       )}
 
-      {/* 单笔交易详情 */}
       {singleTx && <SingleTxCard tx={singleTx} />}
 
-      {/* 资产概览 */}
       {currentQuery.address && !error && !singleTx && (
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
           <div className="lg:col-span-2 bg-gradient-to-br from-[#6E5FE0] to-[#4B3FC0] rounded-2xl p-6 text-white relative overflow-hidden">
             <div className="text-white/70 text-sm font-medium flex items-center gap-1.5 mb-2">
               <DollarSign className="w-4 h-4" /> 预估总资产 (USD)
             </div>
-            {fetchingBalance ? (
-              <div className="h-10 w-48 bg-white/20 animate-pulse rounded-lg" />
-            ) : (
-              <div className="text-3xl md:text-4xl font-bold tracking-tight break-all">
-                ${(walletInfo?.totalUsd || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-              </div>
-            )}
+            {fetchingBalance ? <div className="h-10 w-48 bg-white/20 animate-pulse rounded-lg" />
+              : <div className="text-3xl md:text-4xl font-bold tracking-tight break-all">
+                  ${(walletInfo?.totalUsd || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                </div>}
             <div className="flex gap-6 mt-5 text-sm">
               <div>
                 <div className="text-white/60 text-xs mb-0.5">{walletInfo?.chain || '主币'} 余额</div>
@@ -1030,7 +993,6 @@ function MainContent(props) {
         </div>
       )}
 
-      {/* 交易列表 */}
       {currentQuery.address && !error && !singleTx && (
         <div className="bg-white dark:bg-[#13111C] rounded-2xl border border-slate-200 dark:border-white/5 overflow-hidden">
           <div className="p-4 border-b border-slate-100 dark:border-white/5 flex items-center justify-between gap-3 flex-wrap">
@@ -1086,7 +1048,6 @@ function MainContent(props) {
         </div>
       )}
 
-      {/* 空状态 */}
       {!currentQuery.address && !singleTx && !error && !loading && (
         <div className="py-24 text-center text-slate-400">
           <Search className="w-12 h-12 mx-auto mb-4 opacity-20" />
@@ -1097,11 +1058,10 @@ function MainContent(props) {
   );
 }
 
-// ============ 资产分布图(纯 SVG)============
+// ============ 资产分布图 ============
 function AllocationChart({ data, mobile }) {
   if (!data || data.length === 0) return <p className="text-xs text-slate-400 py-8 text-center">暂无资产数据</p>;
   if (mobile) {
-    // 环形图
     const size = 120, stroke = 16, r = (size - stroke) / 2, c = 2 * Math.PI * r;
     let offset = 0;
     return (
@@ -1129,7 +1089,6 @@ function AllocationChart({ data, mobile }) {
       </div>
     );
   }
-  // 横条
   return (
     <div className="space-y-3">
       {data.map((d, i) => (
@@ -1251,7 +1210,7 @@ function ListSkeleton() {
 }
 
 // ============ 历史卡片 ============
-function HistoryCard({ item, onSelect, onUpdateRemark, onRemove, compact }) {
+function HistoryCard({ item, onSelect, onUpdateRemark, onRemove }) {
   const [editing, setEditing] = useState(false);
   const [val, setVal] = useState(item.remark || '');
   const save = (e) => { e.stopPropagation(); onUpdateRemark(item.address, val); setEditing(false); };
@@ -1312,9 +1271,9 @@ function MobileHistoryList({ history, onJump, onUpdateRemark, onRemove }) {
 }
 
 // ============ 设置面板 ============
-function SettingsPanel({ user, onLogout, theme, setTheme, ethApiKey, setEthApiKey, onSaveKey, showKey, setShowKey }) {
+function SettingsPanel({ user, onLogout, theme, setTheme, ethApiKey, setEthApiKey, trxApiKey, setTrxApiKey, onSaveKey, showKey, setShowKey }) {
   const [saved, setSaved] = useState(false);
-  const handleSave = () => { onSaveKey(ethApiKey); setSaved(true); setTimeout(() => setSaved(false), 2000); };
+  const handleSave = () => { onSaveKey(ethApiKey, trxApiKey); setSaved(true); setTimeout(() => setSaved(false), 2000); };
   const themes = [
     { id: 'light', label: '浅色', icon: Sun },
     { id: 'dark', label: '深色', icon: Moon },
@@ -1328,7 +1287,6 @@ function SettingsPanel({ user, onLogout, theme, setTheme, ethApiKey, setEthApiKe
         <p className="text-sm text-slate-400">管理您的账户偏好、外观和连接配置。</p>
       </div>
 
-      {/* 账户 */}
       <Section title="账户" icon={Wallet}>
         {user && !user.isAnonymous ? (
           <div className="flex items-center justify-between">
@@ -1349,7 +1307,6 @@ function SettingsPanel({ user, onLogout, theme, setTheme, ethApiKey, setEthApiKe
         )}
       </Section>
 
-      {/* 外观 */}
       <Section title="外观" icon={Sun}>
         <div className="grid grid-cols-3 gap-3">
           {themes.map(({ id, label, icon: Icon }) => (
@@ -1364,25 +1321,34 @@ function SettingsPanel({ user, onLogout, theme, setTheme, ethApiKey, setEthApiKe
         </div>
       </Section>
 
-      {/* API 配置 */}
       <Section title="API 配置" icon={Settings}>
-        <label className="block text-sm font-medium mb-1">Etherscan API Key</label>
-        <p className="text-xs text-slate-400 mb-2">用于加速以太坊网络数据的获取与解析。</p>
-        <div className="relative">
-          <input type={showKey ? 'text' : 'password'} value={ethApiKey} onChange={e => setEthApiKey(e.target.value)}
-            placeholder="留空则使用公共节点"
-            className="w-full pl-3 pr-10 py-3 rounded-xl bg-slate-100 dark:bg-white/5 text-sm focus:outline-none focus:ring-2 focus:ring-[#AB9FF2]/40" />
-          <button onClick={() => setShowKey(v => !v)} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400">
-            {showKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+        <div className="space-y-5">
+          <div>
+            <label className="block text-sm font-medium mb-1">Etherscan API Key</label>
+            <p className="text-xs text-slate-400 mb-2">用于加速以太坊网络数据获取(选填,留空用公共节点)。</p>
+            <div className="relative">
+              <input type={showKey ? 'text' : 'password'} value={ethApiKey} onChange={e => setEthApiKey(e.target.value)}
+                placeholder="留空则使用公共节点"
+                className="w-full pl-3 pr-10 py-3 rounded-xl bg-slate-100 dark:bg-white/5 text-sm focus:outline-none focus:ring-2 focus:ring-[#AB9FF2]/40" />
+              <button onClick={() => setShowKey(v => !v)} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400">
+                {showKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+              </button>
+            </div>
+          </div>
+          <div>
+            <label className="block text-sm font-medium mb-1">TronScan API Key</label>
+            <p className="text-xs text-slate-400 mb-2">用于提高波场接口限额,避免频繁查询被限流(选填,留空用公共接口)。</p>
+            <input type={showKey ? 'text' : 'password'} value={trxApiKey} onChange={e => setTrxApiKey(e.target.value)}
+              placeholder="留空则使用公共接口"
+              className="w-full px-3 py-3 rounded-xl bg-slate-100 dark:bg-white/5 text-sm focus:outline-none focus:ring-2 focus:ring-[#AB9FF2]/40" />
+          </div>
+          <button onClick={handleSave}
+            className="px-5 py-2.5 bg-gradient-to-r from-[#AB9FF2] to-[#5C4FE0] text-white text-sm font-semibold rounded-xl shadow-lg shadow-[#AB9FF2]/25 flex items-center gap-2">
+            {saved ? <><Check className="w-4 h-4" /> 已保存</> : '保存配置'}
           </button>
         </div>
-        <button onClick={handleSave}
-          className="mt-3 px-5 py-2.5 bg-gradient-to-r from-[#AB9FF2] to-[#5C4FE0] text-white text-sm font-semibold rounded-xl shadow-lg shadow-[#AB9FF2]/25 flex items-center gap-2">
-          {saved ? <><Check className="w-4 h-4" /> 已保存</> : '保存配置'}
-        </button>
       </Section>
 
-      {/* 网络 */}
       <Section title="网络" icon={Network}>
         {[
           { id: 'ETH', name: 'Ethereum 主网', desc: '启用 ERC-20 代币及交易追踪' },
@@ -1397,8 +1363,8 @@ function SettingsPanel({ user, onLogout, theme, setTheme, ethApiKey, setEthApiKe
               </div>
             </div>
             <button onClick={() => setNetworks(s => ({ ...s, [n.id]: !s[n.id] }))}
-              className={`w-11 h-6 rounded-full transition-colors relative ${networks[n.id] ? 'bg-[#AB9FF2]' : 'bg-slate-300 dark:bg-white/10'}`}>
-              <span className={`absolute top-0.5 w-5 h-5 bg-white rounded-full transition-transform ${networks[n.id] ? 'translate-x-5' : 'translate-x-0.5'}`} />
+              className={`w-12 h-7 rounded-full transition-colors relative flex-shrink-0 ${networks[n.id] ? 'bg-[#AB9FF2]' : 'bg-slate-300 dark:bg-white/10'}`}>
+              <span className={`absolute top-1 left-1 w-5 h-5 bg-white rounded-full shadow-sm transition-transform duration-200 ${networks[n.id] ? 'translate-x-5' : 'translate-x-0'}`} />
             </button>
           </div>
         ))}
