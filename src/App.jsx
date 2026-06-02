@@ -16,7 +16,6 @@ import {
   LogOut, Eye, EyeOff, Trash2, FileText, Network, Calculator, Download,
 } from 'lucide-react';
 
-// ⚠️ 换回你自己的 firebaseConfig
 const firebaseConfig = {
   apiKey: "AIzaSyBfLcdkM6CntqcPbOX42p8QXwmpsHnaKAs",
   authDomain: "wallet-checker-34d3d.firebaseapp.com",
@@ -112,10 +111,7 @@ const resolveEns = async (name) => {
     const addrRes = await ethCall(resolver, addrData);
     const addr = '0x' + addrRes.slice(-40);
     return /^0x0+$/.test(addr) ? null : addr;
-  } catch (e) {
-    console.error('ENS 解析失败', e);
-    return null;
-  }
+  } catch (e) { return null; }
 };
 
 const ethCall = async (to, data) => {
@@ -139,13 +135,7 @@ const ensNamehash = async (name) => {
 };
 
 const keccak256 = (() => {
-  const RC = [
-    [0,1],[0x8082,0],[0x808a,0x80000000],[0x80008000,0x80000000],[0x808b,0],[0x80000001,0],
-    [0x80008081,0x80000000],[0x8009,0x80000000],[0x8a,0],[0x88,0],[0x80008009,0],[0x8000000a,0],
-    [0x8000808b,0],[0x8b,0x80000000],[0x8089,0x80000000],[0x8003,0x80000000],[0x8002,0x80000000],
-    [0x80,0x80000000],[0x800a,0],[0x8000000a,0x80000000],[0x80008081,0x80000000],[0x8080,0x80000000],
-    [0x80000001,0],[0x80008008,0x80000000],
-  ];
+  const RC = [[0,1],[0x8082,0],[0x808a,0x80000000],[0x80008000,0x80000000],[0x808b,0],[0x80000001,0],[0x80008081,0x80000000],[0x8009,0x80000000],[0x8a,0],[0x88,0],[0x80008009,0],[0x8000000a,0],[0x8000808b,0],[0x8b,0x80000000],[0x8089,0x80000000],[0x8003,0x80000000],[0x8002,0x80000000],[0x80,0x80000000],[0x800a,0],[0x8000000a,0x80000000],[0x80008081,0x80000000],[0x8080,0x80000000],[0x80000001,0],[0x80008008,0x80000000]];
   const r = [0,1,62,28,27,36,44,6,55,20,3,10,43,25,39,41,45,15,21,8,18,2,61,56,14];
   function keccakF(s) {
     for (let round = 0; round < 24; round++) {
@@ -213,12 +203,13 @@ const hexToBytes = (hex) => {
 
 const historyRef = (uid) => doc(db, 'artifacts', appId, 'users', uid, 'wallet_data', 'history');
 
+// ============ 主应用 ============
 export default function App() {
   const currentUidRef = useRef(null); 
   const [address, setAddress] = useState('');
   const [chain, setChain] = useState('AUTO');
   const [allTransactions, setAllTransactions] = useState([]);
-  const [rawTransactions, setRawTransactions] = useState([]); // 原始交易数据，用于计算余额
+  const [rawTransactions, setRawTransactions] = useState([]);
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState(null);
@@ -237,12 +228,15 @@ export default function App() {
   const [user, setUser] = useState(null);
   const [authError, setAuthError] = useState('');
   const [showTaxReport, setShowTaxReport] = useState(false);
-
   const [theme, setTheme] = useState('dark');
   const [activeTab, setActiveTab] = useState('search');
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [singleTx, setSingleTx] = useState(null);
   const [showKey, setShowKey] = useState(false);
+
+  // 编辑备注相关状态 - 提升到App层级
+  const [editingRemark, setEditingRemark] = useState(false);
+  const [remarkVal, setRemarkVal] = useState('');
 
   useEffect(() => {
     const saved = localStorage.getItem('theme') || 'dark';
@@ -274,22 +268,17 @@ export default function App() {
       const prevUid = currentUidRef.current;
       const newUid = currentUser ? currentUser.uid : null;
       if (prevUid !== newUid) {
-        setHistory([]);
-        setCurrentQuery({ address: '', chain: '' });
-        setAllTransactions([]);
-        setRawTransactions([]);
-        setWalletInfo(null);
-        setSingleTx(null);
+        setHistory([]); setCurrentQuery({ address: '', chain: '' });
+        setAllTransactions([]); setRawTransactions([]); setWalletInfo(null); setSingleTx(null);
       }
       currentUidRef.current = newUid;
-      if (currentUser) {
-        setUser(currentUser);
-      } else {
+      if (currentUser) setUser(currentUser);
+      else {
         setUser(null);
         if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-          signInWithCustomToken(auth, __initial_auth_token).catch((e) => console.error('token 登录失败', e));
+          signInWithCustomToken(auth, __initial_auth_token).catch((e) => {});
         } else {
-          signInAnonymously(auth).catch((e) => console.error('匿名登录失败', e));
+          signInAnonymously(auth).catch((e) => {});
         }
       }
     });
@@ -303,9 +292,7 @@ export default function App() {
       const savedTrxKey = localStorage.getItem('trx_api_key');
       if (savedTrxKey) setTrxApiKey(savedTrxKey);
     } catch (e) {}
-
     if (!user) { setHistory([]); return; }
-
     const uid = user.uid;
     const ref = historyRef(uid);
     const unsub = onSnapshot(ref, (snap) => {
@@ -338,6 +325,20 @@ export default function App() {
     });
   }, [safeWriteHistory]);
 
+  // 编辑备注的回调函数
+  const handleEditRemark = useCallback(() => {
+    const currentRemark = currentQuery.address ? (history.find(h => h.address.toLowerCase() === currentQuery.address.toLowerCase())?.remark || '') : '';
+    setRemarkVal(currentRemark);
+    setEditingRemark(true);
+  }, [currentQuery.address, history]);
+
+  const handleSaveRemark = useCallback(() => {
+    if (currentQuery.address) {
+      updateRemark(currentQuery.address, remarkVal);
+      setEditingRemark(false);
+    }
+  }, [currentQuery.address, remarkVal, updateRemark]);
+
   useEffect(() => {
     const checkMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
     setIsMobile(checkMobile);
@@ -356,6 +357,8 @@ export default function App() {
     return m;
   }, [history]);
 
+  const currentRemark = currentQuery.address ? (remarkMap[currentQuery.address] || '') : '';
+
   const detectChain = (addr) => {
     if (/^0x[a-fA-F0-9]{40}$/.test(addr)) return 'ETH';
     if (/^T[a-zA-Z0-9]{33}$/.test(addr)) return 'TRX';
@@ -366,9 +369,7 @@ export default function App() {
     const headers = {};
     if (trxApiKey) headers['TRON-PRO-API-KEY'] = trxApiKey;
     const res = await fetch(url, { headers });
-    if (res.status === 429) {
-      throw new Error('Tronscan 接口请求过于频繁');
-    }
+    if (res.status === 429) throw new Error('Tronscan 接口请求过于频繁');
     return res;
   };
 
@@ -397,7 +398,7 @@ export default function App() {
         }
         price = parseFloat(p.price || 0);
       }
-    } catch (e) { console.error('获取余额失败', e); }
+    } catch (e) {}
     const totalUsd = native * price + usdt;
     return { native, usdt, price, totalUsd, chain: targetChain };
   };
@@ -500,53 +501,59 @@ export default function App() {
     }
   };
 
-  // 计算每笔交易后的余额（正确逻辑：从最新到最老倒推）
+  // 计算每笔交易后的余额（修复：从当前余额开始，逐笔往前推）
   const calculatePostTransactionBalances = useCallback((txs, info, addr) => {
     if (!txs || txs.length === 0 || !info) return txs.map(tx => ({ ...tx, postBalance: null }));
     
     const currentNative = info.native;
     const currentUsdt = info.usdt;
     const price = info.price || 0;
-    const currentTotalUsd = info.totalUsd || 0;
     const addrLower = addr?.toLowerCase() || '';
     
     // 按时间倒序（最新在前）
     const sorted = [...txs].sort((a, b) => b.timestamp - a.timestamp);
     
+    // 记录每笔交易发生后的余额
+    const result = [];
     let runningNative = currentNative;
     let runningUsdt = currentUsdt;
     
-    return sorted.map(tx => {
+    for (const tx of sorted) {
       const isOut = tx.from?.toLowerCase() === addrLower;
+      const isIn = tx.to?.toLowerCase() === addrLower;
       const isUsdtToken = tx.symbol === 'USDT';
       const amountNum = parseFloat(tx.rawAmount || 0) / Math.pow(10, (tx.decimals || 18));
       
-      // 记录变动前的余额（交易发生后的余额）
-      const postBalance = {
-        native: runningNative,
-        usdt: runningUsdt,
-        totalUsd: runningNative * price + runningUsdt,
-      };
-      
-      // 反向计算上一笔交易前的余额
-      if (isOut) {
-        // 转出：从当前余额加上这笔转出
-        if (tx.type === 'NATIVE') {
-          runningNative += amountNum;
-        } else if (isUsdtToken) {
-          runningUsdt += amountNum;
+      // 记录当前这笔交易后的余额
+      result.push({
+        ...tx,
+        postBalance: {
+          native: Math.max(0, runningNative),
+          usdt: Math.max(0, runningUsdt),
+          totalUsd: Math.max(0, runningNative * price + runningUsdt),
         }
-      } else if (tx.to?.toLowerCase() === addrLower) {
-        // 转入：从当前余额减去这笔转入
+      });
+      
+      // 反向推算上一笔交易前的余额
+      if (isOut) {
+        // 转出：余额减少
         if (tx.type === 'NATIVE') {
           runningNative -= amountNum;
         } else if (isUsdtToken) {
           runningUsdt -= amountNum;
         }
+      } else if (isIn) {
+        // 转入：余额增加
+        if (tx.type === 'NATIVE') {
+          runningNative += amountNum;
+        } else if (isUsdtToken) {
+          runningUsdt += amountNum;
+        }
       }
-      
-      return { ...tx, postBalance };
-    });
+      // 如果既不是转入也不是转出（如内部合约调用），余额不变
+    }
+    
+    return result;
   }, []);
 
   // 重新计算带余额的交易列表
@@ -562,6 +569,8 @@ export default function App() {
     if (!raw) return;
     setSingleTx(null);
     setShowTaxReport(false);
+    setEditingRemark(false);
+    
     if (!isLoadMore) {
       const info = detectInputType(raw);
       if (info.type === 'ENS') {
@@ -660,6 +669,53 @@ export default function App() {
     localStorage.setItem('trx_api_key', trxKey || '');
   };
 
+  const handleGoogleLogin = async () => {
+    try {
+      const provider = new GoogleAuthProvider();
+      const current = auth.currentUser;
+      if (current && current.isAnonymous) {
+        try { await linkWithPopup(current, provider); return; }
+        catch (linkErr) {
+          if (linkErr.code === 'auth/credential-already-in-use') {
+            const cred = GoogleAuthProvider.credentialFromError(linkErr);
+            const pending = history;
+            const result = await signInWithCredential(auth, cred);
+            const newRef = historyRef(result.user.uid);
+            const newSnap = await getDoc(newRef);
+            const existing = newSnap.exists() ? (newSnap.data().items || []) : [];
+            const map = new Map();
+            [...existing, ...pending].forEach((item) => {
+              if (!item || !item.address) return;
+              const key = item.address.toLowerCase();
+              const prev = map.get(key);
+              if (!prev) map.set(key, item);
+              else map.set(key, { ...prev, ...item, remark: item.remark || prev.remark || '', lastQueried: Math.max(prev.lastQueried || 0, item.lastQueried || 0) });
+            });
+            await setDoc(newRef, { items: cleanForFirestore(Array.from(map.values()).sort((a, b) => (b.lastQueried || 0) - (a.lastQueried || 0))) });
+            return;
+          }
+          throw linkErr;
+        }
+      }
+      await signInWithPopup(auth, provider);
+    } catch (error) {
+      console.error('Google 登录失败', error);
+      if (error.code === 'auth/unauthorized-domain') setAuthError('当前域名未加入 Firebase 授权白名单');
+      else if (error.code === 'auth/popup-closed-by-user') setAuthError('登录窗口被关闭');
+      else setAuthError('登录失败');
+      setTimeout(() => setAuthError(''), 5000);
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      setHistory([]); setCurrentQuery({ address: '', chain: '' });
+      setAllTransactions([]); setRawTransactions([]); setWalletInfo(null); setSingleTx(null);
+      await signOut(auth);
+      await signInAnonymously(auth);
+    } catch (e) {}
+  };
+
   const filteredTransactions = useMemo(() => {
     return allTransactions.filter((tx) => {
       const isOut = tx.from?.toLowerCase() === currentQuery.address;
@@ -702,17 +758,13 @@ export default function App() {
     hasMoreData, loadingMore, isMobile, setShowScanner,
     showTaxReport, setShowTaxReport,
     history, onUpdateRemark: updateRemark, onRemove: removeHistory,
+    // 备注编辑相关
+    editingRemark, setEditingRemark, remarkVal, setRemarkVal,
+    currentRemark, onEditRemark: handleEditRemark, onSaveRemark: handleSaveRemark,
   };
 
   const settingsProps = {
-    user, onLogout: async () => {
-      try {
-        setHistory([]); setCurrentQuery({ address: '', chain: '' });
-        setAllTransactions([]); setRawTransactions([]); setWalletInfo(null); setSingleTx(null);
-        await signOut(auth);
-        await signInAnonymously(auth);
-      } catch (e) { console.error('登出失败', e); }
-    }, theme, setTheme,
+    user, onLogout: handleLogout, theme, setTheme,
     ethApiKey, setEthApiKey, trxApiKey, setTrxApiKey,
     onSaveKey: saveApiKey, showKey, setShowKey,
   };
@@ -726,43 +778,7 @@ export default function App() {
           activeTab={activeTab} setActiveTab={setActiveTab} history={sortedHistory}
           onJump={jumpToAddress} onUpdateRemark={updateRemark} onRemove={removeHistory} />
         <div className="flex-1 flex flex-col overflow-hidden">
-          <TopBar user={user} onLogin={async () => {
-            try {
-              const provider = new GoogleAuthProvider();
-              const current = auth.currentUser;
-              if (current && current.isAnonymous) {
-                try { await linkWithPopup(current, provider); return; }
-                catch (linkErr) {
-                  if (linkErr.code === 'auth/credential-already-in-use') {
-                    const cred = GoogleAuthProvider.credentialFromError(linkErr);
-                    const pending = history;
-                    const result = await signInWithCredential(auth, cred);
-                    const newRef = historyRef(result.user.uid);
-                    const newSnap = await getDoc(newRef);
-                    const existing = newSnap.exists() ? (newSnap.data().items || []) : [];
-                    const map = new Map();
-                    [...existing, ...pending].forEach((item) => {
-                      if (!item || !item.address) return;
-                      const key = item.address.toLowerCase();
-                      const prev = map.get(key);
-                      if (!prev) map.set(key, item);
-                      else map.set(key, { ...prev, ...item, remark: item.remark || prev.remark || '', lastQueried: Math.max(prev.lastQueried || 0, item.lastQueried || 0) });
-                    });
-                    await setDoc(newRef, { items: cleanForFirestore(Array.from(map.values()).sort((a, b) => (b.lastQueried || 0) - (a.lastQueried || 0))) });
-                    return;
-                  }
-                  throw linkErr;
-                }
-              }
-              await signInWithPopup(auth, provider);
-            } catch (error) {
-              console.error('Google 登录失败', error);
-              if (error.code === 'auth/unauthorized-domain') setAuthError('当前域名未加入 Firebase 授权白名单');
-              else if (error.code === 'auth/popup-closed-by-user') setAuthError('登录窗口被关闭');
-              else setAuthError('登录失败');
-              setTimeout(() => setAuthError(''), 5000);
-            }
-          }} onLogout={settingsProps.onLogout}
+          <TopBar user={user} onLogin={handleGoogleLogin} onLogout={handleLogout}
             theme={theme} setTheme={setTheme} onOpenSettings={() => setActiveTab('settings')} />
           <div key={activeTab} className="flex-1 overflow-y-auto px-8 py-6 page-enter">
             {activeTab === 'settings' ? <SettingsPanel {...settingsProps} /> : <MainContent {...mainContentProps} isMobileLayout={false} />}
@@ -770,7 +786,7 @@ export default function App() {
         </div>
       </div>
       <div className="lg:hidden flex flex-col min-h-screen pb-20">
-        <MobileHeader user={user} onLogin={settingsProps.onLogout} onGoogleLogin={mainContentProps.onUpdateRemark} theme={theme} setTheme={setTheme} onAvatar={() => setActiveTab('settings')} />
+        <MobileHeader user={user} onLogin={handleGoogleLogin} theme={theme} setTheme={setTheme} onAvatar={() => setActiveTab('settings')} />
         <div key={activeTab} className="flex-1 px-4 py-4 page-enter">
           {activeTab === 'settings' ? <SettingsPanel {...settingsProps} />
             : activeTab === 'history' ? <MobileHistoryList history={sortedHistory} onJump={jumpToAddress} onUpdateRemark={updateRemark} onRemove={removeHistory} />
@@ -864,9 +880,7 @@ function Sidebar({ collapsed, onToggle, activeTab, setActiveTab, history, onJump
 function TopBar({ user, onLogin, onLogout, theme, setTheme, onOpenSettings }) {
   return (
     <header className="h-16 flex-shrink-0 px-8 flex items-center justify-between border-b border-slate-200 dark:border-white/5 bg-white/70 dark:bg-[#0B0E14]/70 backdrop-blur-xl">
-      <div className="flex items-center gap-2">
-        <span className="font-bold text-lg">Web3 交易查询</span>
-      </div>
+      <span className="font-bold text-lg">Web3 交易查询</span>
       <div className="flex items-center gap-3">
         <ThemeToggleBtn theme={theme} setTheme={setTheme} />
         {user && !user.isAnonymous ? (
@@ -915,14 +929,12 @@ function ThemeToggleBtn({ theme, setTheme }) {
   const next = theme === 'dark' ? 'light' : theme === 'light' ? 'system' : 'dark';
   const Icon = theme === 'dark' ? Moon : theme === 'light' ? Sun : Monitor;
   return (
-    <button onClick={() => setTheme(next)}
-      className="p-2 text-slate-400 hover:text-[#AB9FF2] rounded-full transition-colors" title={`主题: ${theme}`}>
+    <button onClick={() => setTheme(next)} className="p-2 text-slate-400 hover:text-[#AB9FF2] rounded-full transition-colors" title={`主题: ${theme}`}>
       <Icon className="w-5 h-5" />
     </button>
   );
 }
 
-// ============ 移动端底部 Tab - 大按钮占满高度 ============
 function MobileTabBar({ activeTab, setActiveTab }) {
   const tabs = [
     { id: 'search', label: '查询', icon: Search },
@@ -947,6 +959,7 @@ function MobileTabBar({ activeTab, setActiveTab }) {
   );
 }
 
+// ============ 主内容区 ============
 function MainContent(props) {
   const {
     chain, setChain, address, setAddress, handleSearch, loading, error, singleTx,
@@ -955,23 +968,9 @@ function MainContent(props) {
     filteredTransactions, hasMoreData, loadingMore, isMobile, setShowScanner, isMobileLayout,
     showTaxReport, setShowTaxReport,
     history, onUpdateRemark, onRemove,
+    editingRemark, setEditingRemark, remarkVal, setRemarkVal,
+    currentRemark, onEditRemark, onSaveRemark,
   } = props;
-
-  const currentRemark = currentQuery.address ? remarkMap[currentQuery.address] || '' : '';
-  const [editingRemark, setEditingRemark] = useState(false);
-  const [remarkVal, setRemarkVal] = useState('');
-
-  const handleSaveRemark = () => {
-    if (currentQuery.address) {
-      onUpdateRemark(currentQuery.address, remarkVal);
-      setEditingRemark(false);
-    }
-  };
-
-  const handleEditRemark = () => {
-    setRemarkVal(currentRemark || '');
-    setEditingRemark(true);
-  };
 
   return (
     <div className="max-w-5xl mx-auto space-y-5">
@@ -1014,12 +1013,23 @@ function MainContent(props) {
 
       {singleTx && <SingleTxCard tx={singleTx} />}
 
+      {/* 资产卡片和操作区域分开显示 */}
       {currentQuery.address && !error && !singleTx && (
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-          <div className="lg:col-span-2 bg-gradient-to-br from-[#6E5FE0] to-[#4B3FC0] rounded-2xl p-6 text-white relative overflow-hidden">
-            {/* 操作按钮移到预估资产卡片内 */}
+        <div className="space-y-4">
+          {/* 预估资产卡片 */}
+          <div className="bg-gradient-to-br from-[#6E5FE0] to-[#4B3FC0] rounded-2xl p-6 text-white relative overflow-hidden">
+            {/* 备注标签在左上角 */}
+            {currentRemark && (
+              <div className="absolute top-4 left-4">
+                <span className="bg-amber-500/30 text-amber-100 px-2.5 py-1 rounded-lg text-sm font-medium">
+                  {currentRemark}
+                </span>
+              </div>
+            )}
+            
+            {/* 操作按钮在右上角 */}
             <div className="absolute top-4 right-4 flex gap-2 z-10">
-              <button onClick={handleEditRemark} className="flex items-center gap-1.5 px-3 py-1.5 bg-white/20 hover:bg-white/30 rounded-lg text-xs font-medium backdrop-blur-sm transition-all">
+              <button onClick={onEditRemark} className="flex items-center gap-1.5 px-3 py-1.5 bg-white/20 hover:bg-white/30 rounded-lg text-xs font-medium backdrop-blur-sm transition-all">
                 <Edit2 className="w-3.5 h-3.5" /> 编辑备注
               </button>
               <button onClick={() => setShowTaxReport(true)} className="flex items-center gap-1.5 px-3 py-1.5 bg-white/20 hover:bg-white/30 rounded-lg text-xs font-medium backdrop-blur-sm transition-all">
@@ -1027,20 +1037,11 @@ function MainContent(props) {
               </button>
             </div>
             
-            {/* 备注显示 */}
-            {currentRemark && (
-              <div className="absolute top-4 left-4">
-                <span className="bg-amber-500/30 text-amber-100 px-2 py-0.5 rounded text-xs font-medium">
-                  {currentRemark}
-                </span>
-              </div>
-            )}
-            
-            <div className="text-white/70 text-sm font-medium flex items-center gap-1.5 mb-2">
+            <div className="text-white/70 text-sm font-medium flex items-center gap-1.5 mb-2 mt-8">
               <DollarSign className="w-4 h-4" /> 预估总资产 (USD)
             </div>
             {fetchingBalance ? <div className="h-10 w-48 bg-white/20 animate-pulse rounded-lg" />
-              : <div className="text-3xl md:text-4xl font-bold tracking-tight break-all">
+              : <div className="text-3xl md:text-4xl font-bold tracking-tight">
                   ${(walletInfo?.totalUsd || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                 </div>}
             <div className="flex gap-6 mt-5 text-sm">
@@ -1061,11 +1062,11 @@ function MainContent(props) {
                   autoFocus
                   value={remarkVal}
                   onChange={e => setRemarkVal(e.target.value)}
-                  onKeyDown={e => e.key === 'Enter' && handleSaveRemark()}
+                  onKeyDown={e => e.key === 'Enter' && onSaveRemark()}
                   placeholder="输入备注/标签..."
                   className="flex-1 px-3 py-2 rounded-lg bg-white/20 backdrop-blur-sm text-white text-sm placeholder:text-white/50 border border-white/20 focus:outline-none focus:border-white/40"
                 />
-                <button onClick={handleSaveRemark} className="px-3 py-2 bg-emerald-500 hover:bg-emerald-600 rounded-lg text-sm font-medium flex items-center gap-1">
+                <button onClick={onSaveRemark} className="px-3 py-2 bg-emerald-500 hover:bg-emerald-600 rounded-lg text-sm font-medium flex items-center gap-1">
                   <Check className="w-4 h-4" /> 保存
                 </button>
                 <button onClick={() => setEditingRemark(false)} className="px-3 py-2 bg-white/20 hover:bg-white/30 rounded-lg text-sm font-medium">
@@ -1074,6 +1075,8 @@ function MainContent(props) {
               </div>
             )}
           </div>
+          
+          {/* 资产分布卡片 */}
           <div className="bg-white dark:bg-[#13111C] rounded-2xl border border-slate-200 dark:border-white/5 p-5">
             <h3 className="font-bold text-sm mb-3">资产分布</h3>
             {fetchingBalance ? <div className="h-32 bg-slate-100 dark:bg-white/5 animate-pulse rounded-xl" />
@@ -1155,6 +1158,7 @@ function MainContent(props) {
   );
 }
 
+// ============ 税务报表弹窗 ============
 function TaxReportModal({ transactions, walletInfo, currentAddress, onClose }) {
   const [reportType, setReportType] = useState('month');
   const [selectedYear, setSelectedYear] = useState(new Date().getFullYear());
@@ -1209,28 +1213,13 @@ function TaxReportModal({ transactions, walletInfo, currentAddress, onClose }) {
 
   const handleExportCSV = () => {
     const rows = [
-      ['税务报表 - ' + label],
-      ['钱包地址', currentAddress],
-      ['生成时间', new Date().toLocaleString('zh-CN')],
-      [''],
-      ['时间区间', `${start.toLocaleDateString('zh-CN')} ~ ${end.toLocaleDateString('zh-CN')}`],
-      [''],
-      ['=== 交易统计 ==='],
-      ['交易总数', reportData.txCount],
-      [''],
-      ['=== 资产流动 ==='],
-      ['TRX 转入', reportData.trxInflow.toFixed(6)],
-      ['TRX 转出', reportData.trxOutflow.toFixed(6)],
-      ['USDT 转入', reportData.usdtInflow.toFixed(2)],
-      ['USDT 转出', reportData.usdtOutflow.toFixed(2)],
-      [''],
-      ['=== 估值统计 (USD) ==='],
-      ['总转入', reportData.totalInflow.toFixed(2)],
-      ['总转出', reportData.totalOutflow.toFixed(2)],
-      ['净流动', reportData.netFlow.toFixed(2)],
-      [''],
-      ['=== 交易明细 ==='],
-      ['时间', '类型', '方向', '代币', '金额', '交易哈希'],
+      ['税务报表 - ' + label], ['钱包地址', currentAddress], ['生成时间', new Date().toLocaleString('zh-CN')], [''],
+      ['时间区间', `${start.toLocaleDateString('zh-CN')} ~ ${end.toLocaleDateString('zh-CN')}`], [''],
+      ['=== 交易统计 ==='], ['交易总数', reportData.txCount], [''],
+      ['=== 资产流动 ==='], ['TRX 转入', reportData.trxInflow.toFixed(6)], ['TRX 转出', reportData.trxOutflow.toFixed(6)],
+      ['USDT 转入', reportData.usdtInflow.toFixed(2)], ['USDT 转出', reportData.usdtOutflow.toFixed(2)], [''],
+      ['=== 估值统计 (USD) ==='], ['总转入', reportData.totalInflow.toFixed(2)], ['总转出', reportData.totalOutflow.toFixed(2)],
+      ['净流动', reportData.netFlow.toFixed(2)], [''], ['=== 交易明细 ==='], ['时间', '类型', '方向', '代币', '金额', '交易哈希'],
     ];
 
     filteredTxs.forEach(tx => {
@@ -1404,6 +1393,7 @@ function Row({ label, value, mono, onCopy }) {
   );
 }
 
+// ============ 交易行 (带变动后余额) ============
 function TxRow({ tx, currentAddress, remarkMap, onAddressClick, chain }) {
   const isOut = tx.from?.toLowerCase() === currentAddress.toLowerCase();
   const isIn = tx.to && tx.to.toLowerCase() === currentAddress.toLowerCase();
@@ -1447,16 +1437,16 @@ function TxRow({ tx, currentAddress, remarkMap, onAddressClick, chain }) {
           <div className="space-y-0.5">
             {chain === 'TRX' && (
               <>
-                <div className="flex justify-between gap-2"><span className="text-slate-500">TRX:</span><span className="font-medium">{postBal.native.toFixed(2)}</span></div>
-                <div className="flex justify-between gap-2"><span className="text-slate-500">USDT:</span><span className="font-medium">{postBal.usdt.toFixed(2)}</span></div>
+                <div className="flex justify-between gap-2"><span className="text-slate-500">TRX:</span><span className="font-medium">{postBal.native >= 0 ? postBal.native.toFixed(2) : '0.00'}</span></div>
+                <div className="flex justify-between gap-2"><span className="text-slate-500">USDT:</span><span className="font-medium">{postBal.usdt >= 0 ? postBal.usdt.toFixed(2) : '0.00'}</span></div>
               </>
             )}
             {chain === 'ETH' && (
-              <div className="flex justify-between gap-2"><span className="text-slate-500">ETH:</span><span className="font-medium">{postBal.native.toFixed(4)}</span></div>
+              <div className="flex justify-between gap-2"><span className="text-slate-500">ETH:</span><span className="font-medium">{postBal.native >= 0 ? postBal.native.toFixed(4) : '0.0000'}</span></div>
             )}
             <div className="flex justify-between gap-2 pt-1 border-t border-slate-200 dark:border-white/10">
               <span className="text-slate-500">USD:</span>
-              <span className="font-medium text-[#AB9FF2]">${postBal.totalUsd.toFixed(2)}</span>
+              <span className="font-medium text-[#AB9FF2]">${postBal.totalUsd >= 0 ? postBal.totalUsd.toFixed(2) : '0.00'}</span>
             </div>
           </div>
         </div>
