@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { initializeApp } from 'firebase/app';
 import { getAnalytics } from 'firebase/analytics';
 import {
@@ -16,6 +16,7 @@ import {
   LogOut, Eye, EyeOff, Trash2, FileText, Network, Calculator, Download,
 } from 'lucide-react';
 
+// ⚠️ 换回你自己的 firebaseConfig
 const firebaseConfig = {
   apiKey: "AIzaSyBfLcdkM6CntqcPbOX42p8QXwmpsHnaKAs",
   authDomain: "wallet-checker-34d3d.firebaseapp.com",
@@ -217,6 +218,7 @@ export default function App() {
   const [address, setAddress] = useState('');
   const [chain, setChain] = useState('AUTO');
   const [allTransactions, setAllTransactions] = useState([]);
+  const [rawTransactions, setRawTransactions] = useState([]); // 原始交易数据，用于计算余额
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState(null);
@@ -275,6 +277,7 @@ export default function App() {
         setHistory([]);
         setCurrentQuery({ address: '', chain: '' });
         setAllTransactions([]);
+        setRawTransactions([]);
         setWalletInfo(null);
         setSingleTx(null);
       }
@@ -313,74 +316,27 @@ export default function App() {
     return () => unsub();
   }, [user]);
 
-  const migrateHistory = async (newUid, localHistory) => {
-    try {
-      const newRef = historyRef(newUid);
-      const newSnap = await getDoc(newRef);
-      const existing = newSnap.exists() ? (newSnap.data().items || []) : [];
-      const map = new Map();
-      [...existing, ...localHistory].forEach((item) => {
-        if (!item || !item.address) return;
-        const key = item.address.toLowerCase();
-        const prev = map.get(key);
-        if (!prev) map.set(key, item);
-        else map.set(key, {
-          ...prev, ...item,
-          remark: item.remark || prev.remark || '',
-          lastQueried: Math.max(prev.lastQueried || 0, item.lastQueried || 0),
-        });
-      });
-      const merged = Array.from(map.values()).sort((a, b) => (b.lastQueried || 0) - (a.lastQueried || 0));
-      await setDoc(newRef, { items: cleanForFirestore(merged) });
-    } catch (e) { console.error('历史迁移失败', e); }
-  };
-
-  const handleGoogleLogin = async () => {
-    try {
-      const provider = new GoogleAuthProvider();
-      const current = auth.currentUser;
-      if (current && current.isAnonymous) {
-        try {
-          await linkWithPopup(current, provider);
-          return;
-        } catch (linkErr) {
-          if (linkErr.code === 'auth/credential-already-in-use') {
-            const cred = GoogleAuthProvider.credentialFromError(linkErr);
-            const pending = history;
-            const result = await signInWithCredential(auth, cred);
-            await migrateHistory(result.user.uid, pending);
-            return;
-          }
-          throw linkErr;
-        }
-      }
-      await signInWithPopup(auth, provider);
-    } catch (error) {
-      console.error('Google 登录失败', error);
-      if (error.code === 'auth/unauthorized-domain') setAuthError('当前域名未加入 Firebase 授权白名单');
-      else if (error.code === 'auth/popup-closed-by-user') setAuthError('登录窗口被关闭');
-      else setAuthError('登录失败');
-      setTimeout(() => setAuthError(''), 5000);
-    }
-  };
-
-  const handleLogout = async () => {
-    try {
-      setHistory([]);
-      setCurrentQuery({ address: '', chain: '' });
-      setAllTransactions([]);
-      setWalletInfo(null);
-      setSingleTx(null);
-      await signOut(auth);
-      await signInAnonymously(auth);
-    } catch (e) { console.error('登出失败', e); }
-  };
-
-  const safeWriteHistory = (items) => {
+  const safeWriteHistory = useCallback((items) => {
     const uid = user?.uid;
     if (!uid || currentUidRef.current !== uid) return;
     setDoc(historyRef(uid), { items: cleanForFirestore(items) }).catch(console.error);
-  };
+  }, [user]);
+
+  const updateRemark = useCallback((addr, rmk) => {
+    setHistory(prev => {
+      const nh = prev.map(i => i.address === addr ? { ...i, remark: rmk } : i);
+      safeWriteHistory(nh);
+      return nh;
+    });
+  }, [safeWriteHistory]);
+
+  const removeHistory = useCallback((addr) => {
+    setHistory(prev => {
+      const nh = prev.filter(i => i.address !== addr);
+      safeWriteHistory(nh);
+      return nh;
+    });
+  }, [safeWriteHistory]);
 
   useEffect(() => {
     const checkMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
@@ -544,48 +500,62 @@ export default function App() {
     }
   };
 
-  const calculatePostTransactionBalances = (txs, info) => {
-    if (!txs || txs.length === 0 || !info) return txs;
+  // 计算每笔交易后的余额（正确逻辑：从最新到最老倒推）
+  const calculatePostTransactionBalances = useCallback((txs, info, addr) => {
+    if (!txs || txs.length === 0 || !info) return txs.map(tx => ({ ...tx, postBalance: null }));
+    
     const currentNative = info.native;
     const currentUsdt = info.usdt;
     const price = info.price || 0;
     const currentTotalUsd = info.totalUsd || 0;
-    const sorted = [...txs].sort((a, b) => a.timestamp - b.timestamp);
+    const addrLower = addr?.toLowerCase() || '';
+    
+    // 按时间倒序（最新在前）
+    const sorted = [...txs].sort((a, b) => b.timestamp - a.timestamp);
+    
     let runningNative = currentNative;
     let runningUsdt = currentUsdt;
-    let runningTotalUsd = currentTotalUsd;
-    const reversed = [...sorted].reverse();
-    return reversed.map(tx => {
-      const isOut = tx.from?.toLowerCase() === currentQuery.address?.toLowerCase();
-      const isUsdtTx = tx.symbol === 'USDT' || tx.type === 'TOKEN';
-      const amountNum = parseFloat(tx.rawAmount || 0) / Math.pow(10, tx.decimals || 18);
+    
+    return sorted.map(tx => {
+      const isOut = tx.from?.toLowerCase() === addrLower;
+      const isUsdtToken = tx.symbol === 'USDT';
+      const amountNum = parseFloat(tx.rawAmount || 0) / Math.pow(10, (tx.decimals || 18));
+      
+      // 记录变动前的余额（交易发生后的余额）
+      const postBalance = {
+        native: runningNative,
+        usdt: runningUsdt,
+        totalUsd: runningNative * price + runningUsdt,
+      };
+      
+      // 反向计算上一笔交易前的余额
       if (isOut) {
+        // 转出：从当前余额加上这笔转出
         if (tx.type === 'NATIVE') {
           runningNative += amountNum;
-          runningTotalUsd = runningNative * price + runningUsdt;
-        } else if (isUsdtTx) {
+        } else if (isUsdtToken) {
           runningUsdt += amountNum;
-          runningTotalUsd = runningNative * price + runningUsdt;
         }
-      } else {
+      } else if (tx.to?.toLowerCase() === addrLower) {
+        // 转入：从当前余额减去这笔转入
         if (tx.type === 'NATIVE') {
           runningNative -= amountNum;
-          runningTotalUsd = runningNative * price + runningUsdt;
-        } else if (isUsdtTx) {
+        } else if (isUsdtToken) {
           runningUsdt -= amountNum;
-          runningTotalUsd = runningNative * price + runningUsdt;
         }
       }
-      return {
-        ...tx,
-        postBalance: {
-          native: Math.max(0, runningNative),
-          usdt: Math.max(0, runningUsdt),
-          totalUsd: Math.max(0, runningTotalUsd),
-        }
-      };
+      
+      return { ...tx, postBalance };
     });
-  };
+  }, []);
+
+  // 重新计算带余额的交易列表
+  useEffect(() => {
+    if (rawTransactions.length > 0 && walletInfo && currentQuery.address) {
+      const withBalances = calculatePostTransactionBalances(rawTransactions, walletInfo, currentQuery.address);
+      setAllTransactions(withBalances);
+    }
+  }, [rawTransactions, walletInfo, currentQuery.address, calculatePostTransactionBalances]);
 
   const handleSearch = async (rawInput, isLoadMore = false) => {
     const raw = (rawInput ?? address).trim();
@@ -606,7 +576,7 @@ export default function App() {
         let txChain = chain === 'AUTO' ? info.chain : chain;
         setActiveTab('search');
         setLoading(true); setError(null); setWalletInfo(null);
-        setCurrentQuery({ address: '', chain: '' }); setAllTransactions([]);
+        setCurrentQuery({ address: '', chain: '' }); setAllTransactions([]); setRawTransactions([]);
         try {
           const detail = await fetchSingleTx(raw, txChain);
           setSingleTx(detail);
@@ -632,31 +602,34 @@ export default function App() {
       setLoading(true); setFetchingBalance(true); setWalletInfo(null);
       setError(null); setFilterType('ALL'); setCurrentPage(1); setApiPage(1);
       setActiveTab('search');
+      setRawTransactions([]);
     } else setLoadingMore(true);
+
     const targetApiPage = isLoadMore ? apiPage + 1 : 1;
     try {
       if (!isLoadMore) {
-        fetchWalletBalance(addr, targetChain).then((info) => {
-          setWalletInfo(info); setFetchingBalance(false);
-        });
+        const info = await fetchWalletBalance(addr, targetChain);
+        setWalletInfo(info); setFetchingBalance(false);
       }
       let result = { txs: [], hasMore: false };
       if (targetChain === 'ETH') result = await fetchEthData(addr, targetApiPage);
       else if (targetChain === 'TRX') result = await fetchTrxData(addr, targetApiPage);
-      const merged = isLoadMore ? [...allTransactions, ...result.txs] : result.txs;
+      
+      const merged = isLoadMore ? [...rawTransactions, ...result.txs] : result.txs;
       const unique = Array.from(new Map(merged.map(i => [i.hash + i.type, i])).values());
       unique.sort((a, b) => b.timestamp - a.timestamp);
-      const withBalances = calculatePostTransactionBalances(unique, walletInfo);
-      setAllTransactions(withBalances);
+      
+      setRawTransactions(unique);
       setHasMoreData(result.hasMore);
       setApiPage(targetApiPage);
       setCurrentQuery({ address: addr.toLowerCase(), chain: targetChain, ens: ensName || null });
+
       if (!isLoadMore) {
-        setHistory((prev) => {
+        setHistory(prev => {
           const exist = prev.find(i => i.address.toLowerCase() === addr.toLowerCase());
           let nh;
           if (exist) nh = [{ ...exist, lastQueried: Date.now(), ens: ensName || exist.ens || null }, ...prev.filter(i => i.address.toLowerCase() !== addr.toLowerCase())];
-          else nh = [{ address: addr, chain: targetChain, remark: '', ens: ensName || null, lastQueried: Date.now() }, ...prev];
+          else nh = [{ address: addr, chain: targetChain, remark: exist?.remark || '', ens: ensName || null, lastQueried: Date.now() }, ...prev];
           safeWriteHistory(nh); 
           return nh;
         });
@@ -685,22 +658,6 @@ export default function App() {
     setTrxApiKey(trxKey);
     localStorage.setItem('eth_api_key', ethKey || '');
     localStorage.setItem('trx_api_key', trxKey || '');
-  };
-
-  const updateRemark = (addr, rmk) => {
-    setHistory((h) => {
-      const nh = h.map(i => i.address === addr ? { ...i, remark: rmk } : i);
-      safeWriteHistory(nh); 
-      return nh;
-    });
-  };
-
-  const removeHistory = (addr) => {
-    setHistory((h) => {
-      const nh = h.filter(i => i.address !== addr);
-      safeWriteHistory(nh);
-      return nh;
-    });
   };
 
   const filteredTransactions = useMemo(() => {
@@ -748,7 +705,14 @@ export default function App() {
   };
 
   const settingsProps = {
-    user, onLogout: handleLogout, theme, setTheme,
+    user, onLogout: async () => {
+      try {
+        setHistory([]); setCurrentQuery({ address: '', chain: '' });
+        setAllTransactions([]); setRawTransactions([]); setWalletInfo(null); setSingleTx(null);
+        await signOut(auth);
+        await signInAnonymously(auth);
+      } catch (e) { console.error('登出失败', e); }
+    }, theme, setTheme,
     ethApiKey, setEthApiKey, trxApiKey, setTrxApiKey,
     onSaveKey: saveApiKey, showKey, setShowKey,
   };
@@ -762,24 +726,54 @@ export default function App() {
           activeTab={activeTab} setActiveTab={setActiveTab} history={sortedHistory}
           onJump={jumpToAddress} onUpdateRemark={updateRemark} onRemove={removeHistory} />
         <div className="flex-1 flex flex-col overflow-hidden">
-          <TopBar user={user} onLogin={handleGoogleLogin} onLogout={handleLogout}
+          <TopBar user={user} onLogin={async () => {
+            try {
+              const provider = new GoogleAuthProvider();
+              const current = auth.currentUser;
+              if (current && current.isAnonymous) {
+                try { await linkWithPopup(current, provider); return; }
+                catch (linkErr) {
+                  if (linkErr.code === 'auth/credential-already-in-use') {
+                    const cred = GoogleAuthProvider.credentialFromError(linkErr);
+                    const pending = history;
+                    const result = await signInWithCredential(auth, cred);
+                    const newRef = historyRef(result.user.uid);
+                    const newSnap = await getDoc(newRef);
+                    const existing = newSnap.exists() ? (newSnap.data().items || []) : [];
+                    const map = new Map();
+                    [...existing, ...pending].forEach((item) => {
+                      if (!item || !item.address) return;
+                      const key = item.address.toLowerCase();
+                      const prev = map.get(key);
+                      if (!prev) map.set(key, item);
+                      else map.set(key, { ...prev, ...item, remark: item.remark || prev.remark || '', lastQueried: Math.max(prev.lastQueried || 0, item.lastQueried || 0) });
+                    });
+                    await setDoc(newRef, { items: cleanForFirestore(Array.from(map.values()).sort((a, b) => (b.lastQueried || 0) - (a.lastQueried || 0))) });
+                    return;
+                  }
+                  throw linkErr;
+                }
+              }
+              await signInWithPopup(auth, provider);
+            } catch (error) {
+              console.error('Google 登录失败', error);
+              if (error.code === 'auth/unauthorized-domain') setAuthError('当前域名未加入 Firebase 授权白名单');
+              else if (error.code === 'auth/popup-closed-by-user') setAuthError('登录窗口被关闭');
+              else setAuthError('登录失败');
+              setTimeout(() => setAuthError(''), 5000);
+            }
+          }} onLogout={settingsProps.onLogout}
             theme={theme} setTheme={setTheme} onOpenSettings={() => setActiveTab('settings')} />
           <div key={activeTab} className="flex-1 overflow-y-auto px-8 py-6 page-enter">
-            {activeTab === 'settings'
-              ? <SettingsPanel {...settingsProps} />
-              : <MainContent {...mainContentProps} isMobileLayout={false} />}
+            {activeTab === 'settings' ? <SettingsPanel {...settingsProps} /> : <MainContent {...mainContentProps} isMobileLayout={false} />}
           </div>
         </div>
       </div>
       <div className="lg:hidden flex flex-col min-h-screen pb-20">
-        <MobileHeader user={user} onLogin={handleGoogleLogin}
-          theme={theme} setTheme={setTheme} onAvatar={() => setActiveTab('settings')} />
+        <MobileHeader user={user} onLogin={settingsProps.onLogout} onGoogleLogin={mainContentProps.onUpdateRemark} theme={theme} setTheme={setTheme} onAvatar={() => setActiveTab('settings')} />
         <div key={activeTab} className="flex-1 px-4 py-4 page-enter">
-          {activeTab === 'settings'
-            ? <SettingsPanel {...settingsProps} />
-            : activeTab === 'history'
-            ? <MobileHistoryList history={sortedHistory} onJump={jumpToAddress}
-                onUpdateRemark={updateRemark} onRemove={removeHistory} />
+          {activeTab === 'settings' ? <SettingsPanel {...settingsProps} />
+            : activeTab === 'history' ? <MobileHistoryList history={sortedHistory} onJump={jumpToAddress} onUpdateRemark={updateRemark} onRemove={removeHistory} />
             : <MainContent {...mainContentProps} isMobileLayout={true} />}
         </div>
         <MobileTabBar activeTab={activeTab} setActiveTab={setActiveTab} />
@@ -928,6 +922,7 @@ function ThemeToggleBtn({ theme, setTheme }) {
   );
 }
 
+// ============ 移动端底部 Tab - 大按钮占满高度 ============
 function MobileTabBar({ activeTab, setActiveTab }) {
   const tabs = [
     { id: 'search', label: '查询', icon: Search },
@@ -936,15 +931,15 @@ function MobileTabBar({ activeTab, setActiveTab }) {
   ];
   return (
     <nav className="fixed bottom-0 left-0 right-0 z-40 bg-white/90 dark:bg-[#13111C]/90 backdrop-blur-xl border-t border-slate-200 dark:border-white/5"
-      style={{ paddingBottom: 'env(safe-area-inset-bottom)' }}>
-      <div className="flex">
+      style={{ paddingBottom: 'max(env(safe-area-inset-bottom), 8px)' }}>
+      <div className="flex h-16">
         {tabs.map(({ id, label, icon: Icon }) => (
           <button key={id} onClick={() => setActiveTab(id)}
-            className={`flex-1 flex flex-col items-center gap-1 py-3 transition-colors ${
+            className={`flex-1 flex flex-col items-center justify-center gap-1 transition-colors ${
               activeTab === id ? 'text-[#7C6FE8] dark:text-[#AB9FF2]' : 'text-slate-400'
             }`}>
-            <Icon className="w-5 h-5" />
-            <span className="text-[10px] font-medium">{label}</span>
+            <Icon className="w-6 h-6" />
+            <span className="text-xs font-medium">{label}</span>
           </button>
         ))}
       </div>
@@ -974,7 +969,7 @@ function MainContent(props) {
   };
 
   const handleEditRemark = () => {
-    setRemarkVal(currentRemark);
+    setRemarkVal(currentRemark || '');
     setEditingRemark(true);
   };
 
@@ -1022,6 +1017,25 @@ function MainContent(props) {
       {currentQuery.address && !error && !singleTx && (
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
           <div className="lg:col-span-2 bg-gradient-to-br from-[#6E5FE0] to-[#4B3FC0] rounded-2xl p-6 text-white relative overflow-hidden">
+            {/* 操作按钮移到预估资产卡片内 */}
+            <div className="absolute top-4 right-4 flex gap-2 z-10">
+              <button onClick={handleEditRemark} className="flex items-center gap-1.5 px-3 py-1.5 bg-white/20 hover:bg-white/30 rounded-lg text-xs font-medium backdrop-blur-sm transition-all">
+                <Edit2 className="w-3.5 h-3.5" /> 编辑备注
+              </button>
+              <button onClick={() => setShowTaxReport(true)} className="flex items-center gap-1.5 px-3 py-1.5 bg-white/20 hover:bg-white/30 rounded-lg text-xs font-medium backdrop-blur-sm transition-all">
+                <Calculator className="w-3.5 h-3.5" /> 税务报表
+              </button>
+            </div>
+            
+            {/* 备注显示 */}
+            {currentRemark && (
+              <div className="absolute top-4 left-4">
+                <span className="bg-amber-500/30 text-amber-100 px-2 py-0.5 rounded text-xs font-medium">
+                  {currentRemark}
+                </span>
+              </div>
+            )}
+            
             <div className="text-white/70 text-sm font-medium flex items-center gap-1.5 mb-2">
               <DollarSign className="w-4 h-4" /> 预估总资产 (USD)
             </div>
@@ -1039,6 +1053,26 @@ function MainContent(props) {
                 <div className="font-semibold">{fetchingBalance ? '...' : (walletInfo?.usdt || 0).toLocaleString('en-US', { maximumFractionDigits: 2 })}</div>
               </div>
             </div>
+            
+            {/* 备注编辑框 */}
+            {editingRemark && (
+              <div className="mt-4 flex items-center gap-2">
+                <input
+                  autoFocus
+                  value={remarkVal}
+                  onChange={e => setRemarkVal(e.target.value)}
+                  onKeyDown={e => e.key === 'Enter' && handleSaveRemark()}
+                  placeholder="输入备注/标签..."
+                  className="flex-1 px-3 py-2 rounded-lg bg-white/20 backdrop-blur-sm text-white text-sm placeholder:text-white/50 border border-white/20 focus:outline-none focus:border-white/40"
+                />
+                <button onClick={handleSaveRemark} className="px-3 py-2 bg-emerald-500 hover:bg-emerald-600 rounded-lg text-sm font-medium flex items-center gap-1">
+                  <Check className="w-4 h-4" /> 保存
+                </button>
+                <button onClick={() => setEditingRemark(false)} className="px-3 py-2 bg-white/20 hover:bg-white/30 rounded-lg text-sm font-medium">
+                  取消
+                </button>
+              </div>
+            )}
           </div>
           <div className="bg-white dark:bg-[#13111C] rounded-2xl border border-slate-200 dark:border-white/5 p-5">
             <h3 className="font-bold text-sm mb-3">资产分布</h3>
@@ -1048,57 +1082,7 @@ function MainContent(props) {
         </div>
       )}
 
-      {currentQuery.address && !error && !singleTx && (
-        <div className="bg-white dark:bg-[#13111C] rounded-2xl border border-slate-200 dark:border-white/5 p-4">
-          <div className="flex flex-col sm:flex-row items-start sm:items-center gap-4">
-            <div className="flex-1 min-w-0">
-              {editingRemark ? (
-                <div className="flex items-center gap-2">
-                  <input
-                    autoFocus
-                    value={remarkVal}
-                    onChange={e => setRemarkVal(e.target.value)}
-                    onKeyDown={e => e.key === 'Enter' && handleSaveRemark()}
-                    placeholder="输入备注/标签..."
-                    className="flex-1 px-3 py-2 rounded-lg bg-slate-100 dark:bg-white/5 text-sm border border-[#AB9FF2]/40 focus:outline-none focus:ring-2 focus:ring-[#AB9FF2]/40"
-                  />
-                  <button onClick={handleSaveRemark} className="px-3 py-2 bg-emerald-500 text-white rounded-lg text-sm font-medium flex items-center gap-1 hover:bg-emerald-600">
-                    <Check className="w-4 h-4" /> 保存
-                  </button>
-                  <button onClick={() => setEditingRemark(false)} className="px-3 py-2 bg-slate-200 dark:bg-white/10 rounded-lg text-sm font-medium hover:bg-slate-300 dark:hover:bg-white/20">
-                    取消
-                  </button>
-                </div>
-              ) : (
-                <div className="flex items-center gap-2">
-                  <div className={`text-sm ${currentRemark ? 'text-slate-700 dark:text-slate-200' : 'text-slate-400'}`}>
-                    {currentRemark ? (
-                      <span className="flex items-center gap-2">
-                        <span className="bg-amber-100 dark:bg-amber-500/20 text-amber-700 dark:text-amber-300 px-2 py-0.5 rounded text-xs font-medium">备注</span>
-                        {currentRemark}
-                      </span>
-                    ) : (
-                      <span className="text-slate-400">点击编辑按钮添加备注</span>
-                    )}
-                  </div>
-                  <button onClick={handleEditRemark} className="p-2 text-slate-400 hover:text-[#AB9FF2] hover:bg-[#AB9FF2]/10 rounded-lg transition-colors" title="编辑备注">
-                    <Edit2 className="w-4 h-4" />
-                  </button>
-                </div>
-              )}
-            </div>
-            <div className="flex items-center gap-2 flex-shrink-0">
-              <button onClick={handleEditRemark} className="flex items-center gap-2 px-4 py-2.5 bg-blue-500 hover:bg-blue-600 text-white rounded-xl text-sm font-medium shadow-lg shadow-blue-500/25 transition-all">
-                <Edit2 className="w-4 h-4" /> 编辑备注
-              </button>
-              <button onClick={() => setShowTaxReport(true)} className="flex items-center gap-2 px-4 py-2.5 bg-gradient-to-r from-[#AB9FF2] to-[#5C4FE0] hover:shadow-[#AB9FF2]/40 text-white rounded-xl text-sm font-medium shadow-lg shadow-[#AB9FF2]/25 transition-all">
-                <Calculator className="w-4 h-4" /> 税务报表
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
+      {/* 税务报表弹窗 */}
       {showTaxReport && currentQuery.address && (
         <TaxReportModal
           transactions={filteredTransactions}
@@ -1184,82 +1168,43 @@ function TaxReportModal({ transactions, walletInfo, currentAddress, onClose }) {
   const getDateRange = () => {
     const year = selectedYear;
     if (reportType === 'month') {
-      return {
-        start: new Date(year, selectedMonth - 1, 1),
-        end: new Date(year, selectedMonth, 0, 23, 59, 59),
-        label: `${year}年${selectedMonth}月`,
-      };
+      return { start: new Date(year, selectedMonth - 1, 1), end: new Date(year, selectedMonth, 0, 23, 59, 59), label: `${year}年${selectedMonth}月` };
     } else if (reportType === 'quarter') {
       const startMonth = (selectedQuarter - 1) * 3;
-      return {
-        start: new Date(year, startMonth, 1),
-        end: new Date(year, startMonth + 3, 0, 23, 59, 59),
-        label: `${year}年第${selectedQuarter}季度`,
-      };
+      return { start: new Date(year, startMonth, 1), end: new Date(year, startMonth + 3, 0, 23, 59, 59), label: `${year}年第${selectedQuarter}季度` };
     } else {
-      return {
-        start: new Date(year, 0, 1),
-        end: new Date(year, 11, 31, 23, 59, 59),
-        label: `${year}年`,
-      };
+      return { start: new Date(year, 0, 1), end: new Date(year, 11, 31, 23, 59, 59), label: `${year}年` };
     }
   };
 
   const { start, end, label } = getDateRange();
 
   const filteredTxs = useMemo(() => {
-    return transactions.filter(tx => {
-      const ts = tx.timestamp;
-      return ts >= start.getTime() && ts <= end.getTime();
-    });
+    return transactions.filter(tx => tx.timestamp >= start.getTime() && tx.timestamp <= end.getTime());
   }, [transactions, start, end]);
 
   const reportData = useMemo(() => {
-    let totalInflow = 0;
-    let totalOutflow = 0;
-    let trxInflow = 0;
-    let trxOutflow = 0;
-    let usdtInflow = 0;
-    let usdtOutflow = 0;
-    let txCount = 0;
+    let totalInflow = 0, totalOutflow = 0, trxInflow = 0, trxOutflow = 0, usdtInflow = 0, usdtOutflow = 0, txCount = 0;
+    const addrLower = currentAddress.toLowerCase();
+    const price = walletInfo?.price || 0;
 
     filteredTxs.forEach(tx => {
-      const isOut = tx.from?.toLowerCase() === currentAddress.toLowerCase();
-      const isIn = tx.to && tx.to.toLowerCase() === currentAddress.toLowerCase();
-      const amount = parseFloat(tx.rawAmount || 0) / Math.pow(10, tx.decimals || 18);
-      
+      const isOut = tx.from?.toLowerCase() === addrLower;
+      const isIn = tx.to && tx.to.toLowerCase() === addrLower;
+      const amount = parseFloat(tx.rawAmount || 0) / Math.pow(10, (tx.decimals || 18));
       txCount++;
 
       if (tx.symbol === 'TRX' || tx.type === 'NATIVE') {
-        const usdValue = amount * (walletInfo?.price || 0);
-        if (isIn) {
-          totalInflow += usdValue;
-          trxInflow += amount;
-        } else if (isOut) {
-          totalOutflow += usdValue;
-          trxOutflow += amount;
-        }
+        const usdValue = amount * price;
+        if (isIn) { totalInflow += usdValue; trxInflow += amount; }
+        else if (isOut) { totalOutflow += usdValue; trxOutflow += amount; }
       } else if (tx.symbol === 'USDT') {
-        if (isIn) {
-          totalInflow += amount;
-          usdtInflow += amount;
-        } else if (isOut) {
-          totalOutflow += amount;
-          usdtOutflow += amount;
-        }
+        if (isIn) { totalInflow += amount; usdtInflow += amount; }
+        else if (isOut) { totalOutflow += amount; usdtOutflow += amount; }
       }
     });
 
-    return {
-      txCount,
-      totalInflow,
-      totalOutflow,
-      netFlow: totalInflow - totalOutflow,
-      trxInflow,
-      trxOutflow,
-      usdtInflow,
-      usdtOutflow,
-    };
+    return { txCount, totalInflow, totalOutflow, netFlow: totalInflow - totalOutflow, trxInflow, trxOutflow, usdtInflow, usdtOutflow };
   }, [filteredTxs, currentAddress, walletInfo]);
 
   const handleExportCSV = () => {
@@ -1291,14 +1236,7 @@ function TaxReportModal({ transactions, walletInfo, currentAddress, onClose }) {
     filteredTxs.forEach(tx => {
       const isOut = tx.from?.toLowerCase() === currentAddress.toLowerCase();
       const isIn = tx.to && tx.to.toLowerCase() === currentAddress.toLowerCase();
-      rows.push([
-        formatDate(tx.timestamp),
-        tx.type === 'NATIVE' ? '主网币' : '代币',
-        isIn ? '转入' : '转出',
-        tx.symbol,
-        tx.amount,
-        tx.hash,
-      ]);
+      rows.push([formatDate(tx.timestamp), tx.type === 'NATIVE' ? '主网币' : '代币', isIn ? '转入' : '转出', tx.symbol, tx.amount, tx.hash]);
     });
 
     const csvContent = rows.map(row => row.map(cell => `"${cell}"`).join(',')).join('\n');
@@ -1315,44 +1253,29 @@ function TaxReportModal({ transactions, walletInfo, currentAddress, onClose }) {
     <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-[90] p-4">
       <div className="bg-white dark:bg-[#1A1726] rounded-2xl shadow-2xl w-full max-w-2xl max-h-[90vh] overflow-hidden flex flex-col">
         <div className="p-5 border-b border-slate-200 dark:border-white/10 flex items-center justify-between">
-          <h3 className="font-bold text-lg flex items-center gap-2">
-            <Calculator className="w-5 h-5 text-[#AB9FF2]" />
-            税务报表
-          </h3>
-          <button onClick={onClose} className="p-2 text-slate-400 hover:text-slate-600 dark:hover:text-white rounded-lg hover:bg-slate-100 dark:hover:bg-white/10">
-            <X className="w-5 h-5" />
-          </button>
+          <h3 className="font-bold text-lg flex items-center gap-2"><Calculator className="w-5 h-5 text-[#AB9FF2]" />税务报表</h3>
+          <button onClick={onClose} className="p-2 text-slate-400 hover:text-slate-600 dark:hover:text-white rounded-lg hover:bg-slate-100 dark:hover:bg-white/10"><X className="w-5 h-5" /></button>
         </div>
-
         <div className="p-5 border-b border-slate-200 dark:border-white/10 space-y-4">
           <div className="flex gap-2">
-            {[
-              { id: 'month', label: '月报' },
-              { id: 'quarter', label: '季报' },
-              { id: 'year', label: '年报' },
-            ].map(t => (
+            {[{ id: 'month', label: '月报' }, { id: 'quarter', label: '季报' }, { id: 'year', label: '年报' }].map(t => (
               <button key={t.id} onClick={() => setReportType(t.id)}
-                className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
-                  reportType === t.id ? 'bg-[#AB9FF2] text-white' : 'bg-slate-100 dark:bg-white/5 text-slate-600 dark:text-slate-300'
-                }`}>
+                className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${reportType === t.id ? 'bg-[#AB9FF2] text-white' : 'bg-slate-100 dark:bg-white/5 text-slate-600 dark:text-slate-300'}`}>
                 {t.label}
               </button>
             ))}
           </div>
-
           <div className="flex items-center gap-3 flex-wrap">
             <select value={selectedYear} onChange={e => setSelectedYear(parseInt(e.target.value))}
               className="px-3 py-2 rounded-lg bg-slate-100 dark:bg-white/5 text-sm">
               {years.map(y => <option key={y} value={y}>{y}年</option>)}
             </select>
-
             {reportType === 'month' && (
               <select value={selectedMonth} onChange={e => setSelectedMonth(parseInt(e.target.value))}
                 className="px-3 py-2 rounded-lg bg-slate-100 dark:bg-white/5 text-sm">
                 {months.map(m => <option key={m} value={m}>{m}月</option>)}
               </select>
             )}
-
             {reportType === 'quarter' && (
               <select value={selectedQuarter} onChange={e => setSelectedQuarter(parseInt(e.target.value))}
                 className="px-3 py-2 rounded-lg bg-slate-100 dark:bg-white/5 text-sm">
@@ -1361,7 +1284,6 @@ function TaxReportModal({ transactions, walletInfo, currentAddress, onClose }) {
             )}
           </div>
         </div>
-
         <div className="flex-1 overflow-y-auto p-5 space-y-4">
           <div className="grid grid-cols-2 gap-3">
             <div className="bg-gradient-to-br from-emerald-500 to-emerald-600 rounded-xl p-4 text-white">
@@ -1373,49 +1295,24 @@ function TaxReportModal({ transactions, walletInfo, currentAddress, onClose }) {
               <div className="text-xl font-bold">${reportData.totalOutflow.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
             </div>
           </div>
-
           <div className="bg-gradient-to-br from-[#6E5FE0] to-[#4B3FC0] rounded-xl p-4 text-white">
             <div className="text-white/70 text-xs mb-1">净流动 (USD)</div>
-            <div className="text-2xl font-bold">
-              ${reportData.netFlow.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-            </div>
+            <div className="text-2xl font-bold">${reportData.netFlow.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
           </div>
-
           <div className="bg-slate-50 dark:bg-white/5 rounded-xl p-4 space-y-3">
             <h4 className="font-semibold text-sm">详细统计</h4>
             <div className="grid grid-cols-2 gap-4 text-sm">
-              <div>
-                <div className="text-slate-400 text-xs">交易总数</div>
-                <div className="font-semibold">{reportData.txCount}</div>
-              </div>
-              <div>
-                <div className="text-slate-400 text-xs">TRX 转入</div>
-                <div className="font-semibold">{reportData.trxInflow.toFixed(2)}</div>
-              </div>
-              <div>
-                <div className="text-slate-400 text-xs">TRX 转出</div>
-                <div className="font-semibold">{reportData.trxOutflow.toFixed(2)}</div>
-              </div>
-              <div>
-                <div className="text-slate-400 text-xs">USDT 转入</div>
-                <div className="font-semibold">{reportData.usdtInflow.toFixed(2)}</div>
-              </div>
-              <div>
-                <div className="text-slate-400 text-xs">USDT 转出</div>
-                <div className="font-semibold">{reportData.usdtOutflow.toFixed(2)}</div>
-              </div>
+              <div><div className="text-slate-400 text-xs">交易总数</div><div className="font-semibold">{reportData.txCount}</div></div>
+              <div><div className="text-slate-400 text-xs">TRX 转入</div><div className="font-semibold">{reportData.trxInflow.toFixed(2)}</div></div>
+              <div><div className="text-slate-400 text-xs">TRX 转出</div><div className="font-semibold">{reportData.trxOutflow.toFixed(2)}</div></div>
+              <div><div className="text-slate-400 text-xs">USDT 转入</div><div className="font-semibold">{reportData.usdtInflow.toFixed(2)}</div></div>
+              <div><div className="text-slate-400 text-xs">USDT 转出</div><div className="font-semibold">{reportData.usdtOutflow.toFixed(2)}</div></div>
             </div>
           </div>
-
-          <div className="text-center text-xs text-slate-400">
-            时间区间: {start.toLocaleDateString('zh-CN')} ~ {end.toLocaleDateString('zh-CN')}
-          </div>
+          <div className="text-center text-xs text-slate-400">时间区间: {start.toLocaleDateString('zh-CN')} ~ {end.toLocaleDateString('zh-CN')}</div>
         </div>
-
         <div className="p-5 border-t border-slate-200 dark:border-white/10 flex justify-end gap-3">
-          <button onClick={onClose} className="px-4 py-2 bg-slate-100 dark:bg-white/10 rounded-lg text-sm font-medium hover:bg-slate-200 dark:hover:bg-white/20">
-            关闭
-          </button>
+          <button onClick={onClose} className="px-4 py-2 bg-slate-100 dark:bg-white/10 rounded-lg text-sm font-medium hover:bg-slate-200 dark:hover:bg-white/20">关闭</button>
           <button onClick={handleExportCSV} className="flex items-center gap-2 px-4 py-2 bg-emerald-500 hover:bg-emerald-600 text-white rounded-lg text-sm font-medium shadow-lg shadow-emerald-500/25">
             <Download className="w-4 h-4" /> 导出CSV
           </button>
@@ -1540,29 +1437,22 @@ function TxRow({ tx, currentAddress, remarkMap, onAddressClick, chain }) {
           <Clock className="w-3 h-3" />{formatTime(tx.timestamp)}
         </div>
         <div className="flex gap-1.5 justify-end mt-1">
-          <button onClick={() => copyToClipboard(tx.hash)} className="text-slate-300 dark:text-slate-500 hover:text-[#AB9FF2]" title="复制哈希">
-            <Copy className="w-3.5 h-3.5" />
-          </button>
-          <a href={tx.explorerUrl} target="_blank" rel="noreferrer" className="text-slate-300 dark:text-slate-500 hover:text-[#AB9FF2]" title="浏览器查看">
-            <ExternalLink className="w-3.5 h-3.5" />
-          </a>
+          <button onClick={() => copyToClipboard(tx.hash)} className="text-slate-300 dark:text-slate-500 hover:text-[#AB9FF2]" title="复制哈希"><Copy className="w-3.5 h-3.5" /></button>
+          <a href={tx.explorerUrl} target="_blank" rel="noreferrer" className="text-slate-300 dark:text-slate-500 hover:text-[#AB9FF2]" title="浏览器查看"><ExternalLink className="w-3.5 h-3.5" /></a>
         </div>
       </div>
       {postBal && (
-        <div className="flex-shrink-0 bg-slate-50 dark:bg-white/5 rounded-lg p-2 text-xs min-w-[120px]">
+        <div className="flex-shrink-0 bg-slate-50 dark:bg-white/5 rounded-lg p-2 text-xs min-w-[100px]">
           <div className="text-slate-400 mb-1">变动后余额</div>
           <div className="space-y-0.5">
-            {chain !== 'ETH' && (
-              <div className="flex justify-between gap-2">
-                <span className="text-slate-500">TRX:</span>
-                <span className="font-medium">{postBal.native.toFixed(2)}</span>
-              </div>
+            {chain === 'TRX' && (
+              <>
+                <div className="flex justify-between gap-2"><span className="text-slate-500">TRX:</span><span className="font-medium">{postBal.native.toFixed(2)}</span></div>
+                <div className="flex justify-between gap-2"><span className="text-slate-500">USDT:</span><span className="font-medium">{postBal.usdt.toFixed(2)}</span></div>
+              </>
             )}
-            {chain !== 'ETH' && (
-              <div className="flex justify-between gap-2">
-                <span className="text-slate-500">USDT:</span>
-                <span className="font-medium">{postBal.usdt.toFixed(2)}</span>
-              </div>
+            {chain === 'ETH' && (
+              <div className="flex justify-between gap-2"><span className="text-slate-500">ETH:</span><span className="font-medium">{postBal.native.toFixed(4)}</span></div>
             )}
             <div className="flex justify-between gap-2 pt-1 border-t border-slate-200 dark:border-white/10">
               <span className="text-slate-500">USD:</span>
@@ -1609,15 +1499,13 @@ function HistoryCard({ item, onSelect, onUpdateRemark, onRemove }) {
   return (
     <div onClick={onSelect}
       className="group bg-slate-50 dark:bg-white/5 hover:bg-[#AB9FF2]/10 border border-transparent hover:border-[#AB9FF2]/30 rounded-xl p-3 cursor-pointer transition-all relative">
-      <div className="absolute top-2 right-2 flex gap-1.5 opacity-0 group-hover:opacity-100 transition-opacity">
+      <div className="absolute top-2 right-2 flex gap-1.5 opacity-0 group-hover:opacity-100 transition-opacity z-10">
         <button onClick={(e) => { e.stopPropagation(); setEditing(true); setVal(item.remark || ''); }}
-          className="p-2 rounded-lg bg-blue-500 hover:bg-blue-600 text-white transition-colors shadow-md"
-          title="编辑备注">
+          className="p-2 rounded-lg bg-blue-500 hover:bg-blue-600 text-white transition-colors shadow-md" title="编辑备注">
           <Edit2 className="w-4 h-4" />
         </button>
         <button onClick={(e) => { e.stopPropagation(); if(confirm('确定删除这条记录?')) onRemove(item.address); }}
-          className="p-2 rounded-lg bg-rose-500 hover:bg-rose-600 text-white transition-colors shadow-md"
-          title="删除记录">
+          className="p-2 rounded-lg bg-rose-500 hover:bg-rose-600 text-white transition-colors shadow-md" title="删除记录">
           <Trash2 className="w-4 h-4" />
         </button>
       </div>
@@ -1633,11 +1521,9 @@ function HistoryCard({ item, onSelect, onUpdateRemark, onRemove }) {
             <button onClick={save} className="p-1.5 rounded-lg text-emerald-500 hover:bg-emerald-50 dark:hover:bg-emerald-500/10"><Check className="w-4 h-4" /></button>
           </div>
         ) : (
-          <div className="flex items-center justify-between gap-2 text-left group/edit">
-            <span className={`text-xs truncate ${item.remark ? 'text-slate-600 dark:text-slate-300 font-medium' : 'text-slate-400'}`}>
-              {item.remark || '点击添加备注'}
-            </span>
-          </div>
+          <span className={`text-xs truncate ${item.remark ? 'text-slate-600 dark:text-slate-300 font-medium' : 'text-slate-400'}`}>
+            {item.remark || '点击添加备注'}
+          </span>
         )}
       </div>
     </div>
@@ -1679,10 +1565,7 @@ function SettingsPanel({ user, onLogout, theme, setTheme, ethApiKey, setEthApiKe
     { id: 'system', label: '跟随系统', icon: Monitor },
   ];
   const [networks, setNetworks] = useState({ ETH: true, TRX: true });
-
-  const toggleNetwork = (id) => {
-    setNetworks(prev => ({ ...prev, [id]: !prev[id] }));
-  };
+  const toggleNetwork = (id) => setNetworks(prev => ({ ...prev, [id]: !prev[id] }));
 
   return (
     <div className="max-w-2xl mx-auto space-y-5">
@@ -1690,7 +1573,6 @@ function SettingsPanel({ user, onLogout, theme, setTheme, ethApiKey, setEthApiKe
         <h2 className="font-bold text-2xl">设置</h2>
         <p className="text-sm text-slate-400">管理您的账户偏好、外观和连接配置。</p>
       </div>
-
       <Section title="账户" icon={Wallet}>
         {user && !user.isAnonymous ? (
           <div className="flex items-center justify-between">
@@ -1710,7 +1592,6 @@ function SettingsPanel({ user, onLogout, theme, setTheme, ethApiKey, setEthApiKe
           <p className="text-sm text-slate-400">当前未登录,登录后可云端同步查询历史。</p>
         )}
       </Section>
-
       <Section title="外观" icon={Sun}>
         <div className="grid grid-cols-3 gap-3">
           {themes.map(({ id, label, icon: Icon }) => (
@@ -1724,7 +1605,6 @@ function SettingsPanel({ user, onLogout, theme, setTheme, ethApiKey, setEthApiKe
           ))}
         </div>
       </Section>
-
       <Section title="API 配置" icon={Settings}>
         <div className="space-y-5">
           <div>
@@ -1752,7 +1632,6 @@ function SettingsPanel({ user, onLogout, theme, setTheme, ethApiKey, setEthApiKe
           </button>
         </div>
       </Section>
-
       <Section title="网络" icon={Network}>
         {[
           { id: 'ETH', name: 'Ethereum 主网', desc: '启用 ERC-20 代币及交易追踪' },
